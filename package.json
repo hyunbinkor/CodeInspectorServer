@@ -1,0 +1,29 @@
+{
+  "name": "code-quality-server",
+  "version": "1.0.0",
+  "description": "Java 코드 품질 검사 API 서버",
+  "type": "module",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.15.1",
+    "cors": "^2.8.5",
+    "csv-parse": "^5.5.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "java-parser": "^2.0.4",
+    "jszip": "^3.10.1",
+    "uuid": "^9.0.1",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

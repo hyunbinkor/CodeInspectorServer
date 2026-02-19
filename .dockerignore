@@ -1,0 +1,46 @@
+# 의존성 (컨테이너 내에서 새로 설치)
+node_modules/
+
+# 개발용 파일
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+
+# 로그/임시 파일
+*.log
+npm-debug.log*
+.npm/
+
+# 테스트
+test/
+tests/
+*.test.js
+*.spec.js
+coverage/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 문서
+*.md
+!README.md
+docs/
+
+# 백업 (기존 백업은 제외, 실행 시 새로 생성)
+backup/*.json
+
+# 빌드 스크립트
+Dockerfile
+docker-compose*.yml
+.dockerignore

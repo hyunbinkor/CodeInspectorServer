@@ -1,0 +1,5 @@
+node_modules
+.env
+asssets
+test-api.sh
+code-quality-server-1.0.0.tar

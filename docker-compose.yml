@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Docker Compose - 개발/테스트용
+# 
+# 실제 운영 환경에서는 CI/CD 부서의 배포 방식을 따르세요.
+# 이 파일은 참고용입니다.
+# ═══════════════════════════════════════════════════════════════════════════
+
+version: '3.8'
+
+services:
+  # ─────────────────────────────────────────────────────────────────────────
+  # 코드 품질 검사 API 서버
+  # ─────────────────────────────────────────────────────────────────────────
+  code-quality-api:
+    image: code-quality-server:1.0.0
+    container_name: code-quality-api
+    
+    # 환경 변수 (내부망 주소로 수정 필요)
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      
+      # vLLM 서버 주소 (내부망)
+      - VLLM_BASE_URL=http://10.131.48.41:11434
+      - VLLM_MODEL=ShcCodeAssistant
+      - VLLM_TIMEOUT=180000
+      
+      # Qdrant 서버 주소 (내부망)
+      - QDRANT_HOST=qdrant-server
+      - QDRANT_PORT=433
+      - QDRANT_COLLECTION=rules
+      
+      # 로깅
+      - LOG_LEVEL=info
+    
+    # 포트 매핑
+    ports:
+      - "3000:3000"
+    
+    # 헬스체크
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # 재시작 정책
+    restart: unless-stopped
+    
+    # 리소스 제한 (선택사항)
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    
+    # 볼륨 (백업 데이터 영속화)
+    volumes:
+      - backup-data:/app/backup
+    
+    # 네트워크
+    networks:
+      - internal-network
+
+# ─────────────────────────────────────────────────────────────────────────
+# 볼륨 정의
+# ─────────────────────────────────────────────────────────────────────────
+volumes:
+  backup-data:
+    driver: local
+
+# ─────────────────────────────────────────────────────────────────────────
+# 네트워크 정의
+# ─────────────────────────────────────────────────────────────────────────
+networks:
+  internal-network:
+    driver: bridge
