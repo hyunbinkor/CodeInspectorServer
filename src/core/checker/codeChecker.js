@@ -193,35 +193,61 @@ export class CodeChecker {
    */
   async checkCode(code, fileName = 'unknown', options = {}) {
     const startTime = Date.now();
+    const onProgress = options.onProgress || (() => {});  // ← 추가
     const lineCount = code.split('\n').length;
-
+  
     // 청킹 필요 여부 판단
-    const needsChunking = options.forceChunk || 
+    const needsChunking = options.forceChunk ||
                           this.methodChunker.needsChunking(code);
-
+  
+    // ← 추가: 시작 이벤트
+    onProgress({
+      stage: 'start',
+      fileName,
+      lineCount,
+      chunked: needsChunking,
+      timestamp: Date.now()
+    });
+  
     if (needsChunking) {
       logger.info(`[${fileName}] 대용량 파일 (${lineCount}줄) - 청킹 모드 활성화`);
-      return this.checkCodeChunked(code, fileName, options);
+      return this.checkCodeChunked(code, fileName, options);  // options에 onProgress 포함
     }
-
+  
     // 일반 모드
     this.filteringStats.totalChecks++;
-
+  
     // Step 1: 코드 태깅
     logger.debug(`[${fileName}] 태깅 시작...`);
     const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
     const tags = taggingResult.tags;
     logger.info(`[${fileName}] 태그 ${tags.length}개: ${tags.slice(0, 5).join(', ')}...`);
-
+  
+    // ← 추가: 태깅 완료 이벤트
+    onProgress({
+      stage: 'tagging',
+      status: 'done',
+      tagCount: tags.length,
+      elapsed: Date.now() - startTime
+    });
+  
     // Step 2: AST 분석
     const astResult = this.astParser.parseJavaCode(code);
     const astAnalysis = astResult.analysis;
-
+  
     // Step 3: 태그 기반 룰 조회
     logger.debug(`[${fileName}] 룰 조회...`);
     const matchedRules = await this.qdrantClient.findRulesByTags(tags);
     logger.info(`[${fileName}] 매칭된 룰 ${matchedRules.length}개`);
-
+  
+    // ← 추가: 룰 조회 완료 이벤트
+    onProgress({
+      stage: 'rules',
+      status: 'done',
+      ruleCount: matchedRules.length,
+      elapsed: Date.now() - startTime
+    });
+  
     if (matchedRules.length === 0) {
       return {
         success: true,
@@ -231,32 +257,42 @@ export class CodeChecker {
         duration: Date.now() - startTime
       };
     }
-
+  
     // Step 4: v4.0 사전 필터링 (checkType별)
     logger.info(`[${fileName}] checkType별 사전 필터링...`);
     const filterResult = this.preFilterRules(code, astAnalysis, matchedRules, tags);
-
+  
     logger.info(`[${fileName}] → pure_regex 위반: ${filterResult.pureRegexViolations.length}개`);
     logger.info(`[${fileName}] → LLM 후보: ${filterResult.llmCandidates.total}개`);
-
+  
+    // ← 추가: 필터링 완료 이벤트
+    onProgress({
+      stage: 'filter',
+      status: 'done',
+      pureRegexCount: filterResult.pureRegexViolations.length,
+      llmCandidateCount: filterResult.llmCandidates.total,
+      elapsed: Date.now() - startTime
+    });
+  
+    // 통계 업데이트
     this.filteringStats.pureRegexViolations += filterResult.pureRegexViolations.length;
     this.filteringStats.llmCandidates += filterResult.llmCandidates.total;
-
+  
     // Step 5: pure_regex 위반 수집
     const issues = [...filterResult.pureRegexViolations];
-
+  
     // Step 6: LLM 검증 (후보가 있을 때만)
     if (filterResult.llmCandidates.total > 0) {
-      // llmCalls는 verifyWithLLM 내부에서 개별 호출마다 증가
       const llmViolations = await this.verifyWithLLM(
-        code, astAnalysis, filterResult.llmCandidates, fileName, tags
+        code, astAnalysis, filterResult.llmCandidates, fileName, tags,
+        onProgress  // ← 추가: 콜백 전달
       );
       issues.push(...llmViolations);
     }
-
+  
     // Step 7: 중복 제거
     const uniqueIssues = this.deduplicateViolations(issues);
-
+  
     // Step 8: 결과 빌드
     const report = this.resultBuilder.buildReport({
       fileName,
@@ -266,9 +302,9 @@ export class CodeChecker {
       issues: uniqueIssues,
       duration: Date.now() - startTime
     });
-
+  
     logger.info(`[${fileName}] 이슈 ${uniqueIssues.length}개 발견 (${Date.now() - startTime}ms)`);
-
+  
     return report;
   }
 
@@ -597,52 +633,54 @@ export class CodeChecker {
   /**
    * LLM 통합 검증
    */
-  async verifyWithLLM(sourceCode, astAnalysis, llmCandidates, fileName, tags) {
+  async verifyWithLLM(sourceCode, astAnalysis, llmCandidates, fileName, tags, onProgress = () => {}) {
+    //                                                                                ^^^^^^^^^^^^^^^^^^^^^^^^ 추가
     const violations = [];
-
+  
     // 모든 후보를 하나의 배열로 통합
     const allItems = [
       ...llmCandidates.llm_with_regex.map(i => ({ ...i, type: 'llm_with_regex' })),
       ...llmCandidates.llm_contextual.map(i => ({ ...i, type: 'llm_contextual' })),
       ...llmCandidates.llm_with_ast.map(i => ({ ...i, type: 'llm_with_ast' }))
     ];
-
+  
     if (allItems.length === 0) return violations;
-
+  
+    const totalItems = allItems.length;  // ← 추가
     logger.info(`[${fileName}] LLM 개별 검증 시작: ${allItems.length}개 규칙`);
-
+  
     const truncatedCode = this.truncateCode(sourceCode, 4000);
-
+  
     // 각 규칙마다 개별 LLM 호출 (정확도 우선)
     for (let i = 0; i < allItems.length; i++) {
       const item = allItems[i];
       const rule = item.rule;
       const ruleNum = i + 1;
-
+      const itemStartTime = Date.now();  // ← 추가
+  
       try {
-        // 개선된 프롬프트: AST 정보 + 태그 + 예시 포함
+        // 개선된 프롬프트
         const prompt = this.buildSingleRulePrompt(truncatedCode, item, astAnalysis, tags);
-        
+  
         const startTime = Date.now();
         const response = await this.llmClient.generateCompletion(prompt, {
           temperature: 0.1,
           max_tokens: 1000
         });
         const elapsed = Date.now() - startTime;
-
+  
         // llmCalls 증가
         this.filteringStats.llmCalls++;
-
+  
         logger.debug(`[${fileName}] 규칙 ${ruleNum}/${allItems.length} [${rule.ruleId}]: ${elapsed}ms`);
-
+  
         // 응답 파싱
         const parsed = this.llmClient.cleanAndExtractJSON(response);
-        
+  
         if (parsed) {
-          // 단일 위반 객체 또는 violations 배열 처리
-          const violationData = parsed.violation !== undefined ? parsed : 
+          const violationData = parsed.violation !== undefined ? parsed :
                                (parsed.violations?.[0] || null);
-          
+  
           if (violationData && violationData.violation === true) {
             violations.push({
               ruleId: rule.ruleId,
@@ -659,18 +697,39 @@ export class CodeChecker {
             logger.info(`[${fileName}] ⚠️ 위반 발견: ${rule.ruleId} (라인 ${violationData.line || '?'})`);
           }
         }
-
+  
+        // ← 추가: LLM 진행 이벤트 전송
+        onProgress({
+          stage: 'llm',
+          current: i + 1,
+          total: totalItems,
+          ruleId: rule.ruleId,
+          checkType: item.type,
+          elapsed: Date.now() - itemStartTime
+        });
+  
         // API 부하 방지 딜레이
         if (i < allItems.length - 1) {
           await this._sleep(100);
         }
-
+  
       } catch (error) {
         logger.warn(`[${fileName}] 규칙 ${ruleNum} [${rule.ruleId}] LLM 실패: ${error.message}`);
         this.filteringStats.llmCalls++;  // 실패해도 카운트
+  
+        // ← 추가: 실패해도 진행 이벤트는 전송
+        onProgress({
+          stage: 'llm',
+          current: i + 1,
+          total: totalItems,
+          ruleId: rule.ruleId,
+          checkType: item.type,
+          elapsed: Date.now() - itemStartTime,
+          error: error.message
+        });
       }
     }
-
+  
     logger.info(`[${fileName}] LLM 검증 완료: ${violations.length}개 위반 발견 (${this.filteringStats.llmCalls}회 호출)`);
     return violations;
   }
@@ -1275,21 +1334,31 @@ ${rulesDescription}
   async checkCodeChunked(code, fileName, options = {}) {
     const startTime = Date.now();
     const outputFormat = options.outputFormat || 'sarif';
-
+    const onProgress = options.onProgress || (() => {});  // ← 추가
+  
     logger.info(`[${fileName}] 🔪 청킹 시작...`);
-
+  
     // 1. 코드 청킹
     const chunkingResult = this.methodChunker.chunk(code, { fileName });
     const { chunks, metadata: chunkMeta } = chunkingResult;
-
+  
     logger.info(`[${fileName}] ${chunkMeta.totalChunks}개 청크 생성 (${chunkMeta.totalMethods}개 메서드)`);
-
+  
+    // ← 추가: 청킹 완료 이벤트
+    onProgress({
+      stage: 'chunking',
+      status: 'done',
+      totalChunks: chunkMeta.totalChunks,
+      totalMethods: chunkMeta.totalMethods,
+      elapsed: Date.now() - startTime
+    });
+  
     // 2. 청크별 검사 (순차 처리 - LLM 부하 방지)
     const chunkResults = [];
-
+  
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
-
+  
       // 헤더/푸터 청크는 검사 스킵 (메서드가 아님)
       if (chunk.type === 'header' || chunk.type === 'footer') {
         logger.debug(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.type}] 스킵`);
@@ -1301,32 +1370,71 @@ ${rulesDescription}
         });
         continue;
       }
-
+  
+      const chunkStartTime = Date.now();
+  
+      // ← 추가: 청크 시작 이벤트
+      onProgress({
+        stage: 'chunk_start',
+        chunkIndex: i + 1,
+        chunkTotal: chunks.length,
+        methodName: chunk.methodName || `chunk_${i + 1}`,
+        lineRange: chunk.lineRange || null
+      });
+  
       logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName}] 검사 중...`);
-
+  
       try {
         // 청크 코드 (헤더 포함 버전 또는 원본)
         const chunkCode = chunk.codeWithHeader || chunk.code;
-
-        // 개별 청크 검사 (청킹 없이)
-        const chunkStartTime = Date.now();
-        const result = await this.checkCodeDirect(chunkCode, `${fileName}:${chunk.methodName}`);
+  
+        // ← 추가: 청크 내 LLM 이벤트를 chunk_llm으로 래핑
+        const chunkOnProgress = (progress) => {
+          if (progress.stage === 'llm') {
+            onProgress({
+              stage: 'chunk_llm',
+              chunkIndex: i + 1,
+              chunkTotal: chunks.length,
+              current: progress.current,
+              total: progress.total,
+              ruleId: progress.ruleId,
+              elapsed: progress.elapsed
+            });
+          }
+          // 다른 이벤트(tagging, rules, filter)는 청크별로 빠르므로 생략 가능
+        };
+  
+        // 개별 청크 검사 (청킹 없이) - onProgress 전달
+        const result = await this.checkCodeDirect(chunkCode, `${fileName}:${chunk.methodName}`, {
+          onProgress: chunkOnProgress  // ← 추가
+        });
+  
         const chunkElapsed = Date.now() - chunkStartTime;
-
+  
         chunkResults.push({
           chunkIndex: chunk.index,
           issues: result.issues || [],
           processingTime: chunkElapsed,
           llmCalls: result.stats?.llmCalls || 0
         });
-
+  
         logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName}] 완료: ${result.issues?.length || 0}개 이슈 (${chunkElapsed}ms)`);
-
+  
+        // ← 추가: 청크 완료 이벤트
+        onProgress({
+          stage: 'chunk_done',
+          chunkIndex: i + 1,
+          chunkTotal: chunks.length,
+          methodName: chunk.methodName || `chunk_${i + 1}`,
+          issueCount: result.issues?.length || 0,
+          elapsed: chunkElapsed
+        });
+  
         // API 부하 방지 딜레이
         if (i < chunks.length - 1) {
           await this._sleep(200);
         }
-
+  
       } catch (error) {
         logger.error(`[${fileName}] 청크 ${i + 1} 검사 실패: ${error.message}`);
         chunkResults.push({
@@ -1336,17 +1444,42 @@ ${rulesDescription}
           llmCalls: 0,
           error: error.message
         });
+  
+        // ← 추가: 청크 실패 이벤트
+        onProgress({
+          stage: 'chunk_done',
+          chunkIndex: i + 1,
+          chunkTotal: chunks.length,
+          methodName: chunk.methodName || `chunk_${i + 1}`,
+          issueCount: 0,
+          elapsed: Date.now() - chunkStartTime,
+          error: error.message
+        });
       }
     }
-
+  
     // 3. 결과 통합
+    // ← 추가: 병합 시작 이벤트
+    onProgress({
+      stage: 'merging',
+      status: 'start'
+    });
+  
     const mergedResult = this.chunkResultMerger.merge(chunkResults, chunkingResult, options);
     mergedResult.processing.startTime = new Date(startTime).toISOString();
-
+  
     const totalElapsed = Date.now() - startTime;
     logger.info(`[${fileName}] 🎯 청킹 검사 완료: ${mergedResult.summary.totalIssues}개 이슈 (${totalElapsed}ms)`);
-
-    // 4. 출력 형식 변환
+  
+    // ← 추가: 병합 완료 이벤트
+    onProgress({
+      stage: 'merging',
+      status: 'done',
+      totalIssues: mergedResult.summary.totalIssues,
+      elapsed: totalElapsed
+    });
+  
+    // 4. 출력 형식 변환 (기존 로직 그대로)
     if (outputFormat === 'sarif') {
       const sarif = this.chunkResultMerger.toSARIF(mergedResult, options);
       return {
@@ -1354,7 +1487,6 @@ ${rulesDescription}
         chunked: true,
         format: 'sarif',
         sarif,
-        // 기존 호환용
         issues: mergedResult.issues,
         summary: mergedResult.summary,
         stats: {
@@ -1379,7 +1511,6 @@ ${rulesDescription}
         }
       };
     } else {
-      // 기본: JSON
       const simple = this.chunkResultMerger.toSimpleJSON(mergedResult);
       return {
         success: true,
@@ -1404,24 +1535,26 @@ ${rulesDescription}
    * @param {string} fileName - 파일명
    * @returns {Object} 검사 결과
    */
-  async checkCodeDirect(code, fileName) {
+  async checkCodeDirect(code, fileName, options = {}) {
+    //                                          ^^^^^^^^^^^^^^^^^^ 추가 (기존: 파라미터 없음)
     const startTime = Date.now();
+    const onProgress = options.onProgress || (() => {});  // ← 추가
     this.filteringStats.totalChecks++;
-
+  
     // Step 1: 코드 태깅
     const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
     const tags = taggingResult.tags;
-
+  
     // Step 2: AST 분석
     const astResult = this.astParser.parseJavaCode(code);
     const astAnalysis = astResult.analysis;
-
+  
     // Step 3: 태그 기반 룰 조회
     const matchedRules = await this.qdrantClient.findRulesByTags(tags, {
       limit: 50,
       scoreThreshold: 0.3
     });
-
+  
     if (matchedRules.length === 0) {
       return {
         success: true,
@@ -1429,24 +1562,25 @@ ${rulesDescription}
         stats: { llmCalls: 0 }
       };
     }
-
+  
     // Step 4: 사전 필터링
     const filterResult = this.preFilterRules(code, astAnalysis, matchedRules);
-
+  
     // Step 5: pure_regex 위반 수집
     const issues = [...filterResult.pureRegexViolations];
-
+  
     // Step 6: LLM 검증
     if (filterResult.llmCandidates.total > 0) {
       const llmViolations = await this.verifyWithLLM(
-        code, astAnalysis, filterResult.llmCandidates, fileName, tags
+        code, astAnalysis, filterResult.llmCandidates, fileName, tags,
+        onProgress  // ← 추가: 콜백 전달
       );
       issues.push(...llmViolations);
     }
-
+  
     // Step 7: 중복 제거
     const uniqueIssues = this.deduplicateViolations(issues);
-
+  
     return {
       success: true,
       issues: uniqueIssues,

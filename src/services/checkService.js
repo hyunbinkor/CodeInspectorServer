@@ -38,7 +38,7 @@ export class CheckService {
   }
 
   /**
-   * 코드 검사 실행
+   * 코드 검사 실행 (기존 - 변경 없음)
    * 
    * @param {string} code - Java 소스 코드
    * @param {string} fileName - 파일명
@@ -75,60 +75,86 @@ export class CheckService {
   }
 
   /**
-   * 응답 형식 변환
-   * @private
+   * 진행 상황 콜백을 지원하는 코드 검사 (SSE 스트리밍용)
+   * 
+   * @param {string} code - Java 소스 코드
+   * @param {string} fileName - 파일명
+   * @param {Object} options - 검사 옵션
+   * @param {Function} onProgress - 진행 상황 콜백 (progress) => void
+   * @returns {Promise<Object>} 검사 결과
    */
-  formatResponse(result, format, elapsed) {
-    const baseResponse = {
-      success: result.success !== false,
-      fileName: result.fileName || result.file?.name,
-      lineCount: result.lineCount || result.file?.totalLines,
-      chunked: result.chunked || false,
-      processingTimeMs: elapsed
-    };
+  async checkCodeWithProgress(code, fileName = 'unknown.java', options = {}, onProgress = () => {}) {
+    await this.ensureInitialized();
 
-    if (format === 'sarif') {
-      return {
-        ...baseResponse,
-        format: 'sarif',
-        sarif: result.sarif,
-        issues: result.issues,
-        summary: result.summary || this.buildSummary(result.issues)
-      };
+    const startTime = Date.now();
+    const outputFormat = options.format || 'json';
+
+    logger.info(`[CheckService] 스트리밍 검사 시작: ${fileName} (${code.length}자)`);
+
+    try {
+      // codeChecker.checkCode()에 onProgress 콜백 전달
+      const result = await this.codeChecker.checkCode(code, fileName, {
+        forceChunk: options.forceChunk,
+        outputFormat: outputFormat,
+        onProgress: onProgress  // 콜백 전달
+      });
+
+      const elapsed = Date.now() - startTime;
+      logger.info(`[CheckService] 스트리밍 검사 완료: ${result.issues?.length || 0}개 이슈 (${elapsed}ms)`);
+
+      // 응답 형식 통일
+      return this.formatResponse(result, outputFormat, elapsed);
+
+    } catch (error) {
+      logger.error(`[CheckService] 스트리밍 검사 실패: ${error.message}`);
+      throw error;
     }
-
-    if (format === 'github') {
-      // GitHub Actions 어노테이션 형식
-      const annotations = result.annotations || 
-        this.buildGitHubAnnotations(result.issues, baseResponse.fileName);
-
-      return {
-        ...baseResponse,
-        format: 'github',
-        annotations,
-        issues: result.issues,
-        summary: result.summary || this.buildSummary(result.issues)
-      };
-    }
-
-    // 기본 JSON 형식
-    return {
-      ...baseResponse,
-      format: 'json',
-      issues: result.issues || [],
-      summary: result.summary || this.buildSummary(result.issues),
-      tags: result.tags || [],
-      matchedRulesCount: result.matchedRulesCount || 0,
-      stats: result.stats || {}
-    };
   }
 
   /**
-   * 요약 생성
+   * 응답 형식 통일
+   * @private
+   */
+  formatResponse(result, format, elapsed) {
+    const response = {
+      success: result.success !== false,
+      fileName: result.fileName,
+      format: format,
+      issues: result.issues || [],
+      summary: result.summary || this.buildSummary(result.issues || []),
+      processingTimeMs: elapsed
+    };
+
+    // 청킹 정보
+    if (result.chunked) {
+      response.chunked = true;
+    }
+
+    // SARIF 형식
+    if (format === 'sarif' && result.sarif) {
+      response.sarif = result.sarif;
+    }
+
+    // GitHub 어노테이션 형식
+    if (format === 'github') {
+      response.annotations = result.annotations || 
+        this.buildGitHubAnnotations(result.issues, result.fileName);
+    }
+
+    // 통계
+    if (result.stats) {
+      response.stats = result.stats;
+    }
+
+    return response;
+  }
+
+  /**
+   * 이슈 요약 생성
    * @private
    */
   buildSummary(issues = []) {
-    const bySeverity = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+    const bySeverity = {};
     const byCategory = {};
 
     for (const issue of issues) {
