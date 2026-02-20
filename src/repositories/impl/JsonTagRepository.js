@@ -200,6 +200,7 @@ export class JsonTagRepository extends ITagRepository {
     this.data = newData;
     
     // 파일에 저장
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
     await fs.writeFile(this.filePath, JSON.stringify(this.data, null, 2), 'utf-8');
     
     logger.info(`✅ 태그 정의 저장 완료: ${this.filePath}`);
