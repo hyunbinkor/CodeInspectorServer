@@ -204,19 +204,6 @@ class PostgresRuleRepository extends IRuleRepository { ... }
 
 IDE/CI 통합을 위한 SARIF 2.1.0 형식
 
-### GitHub
-
-GitHub Actions 어노테이션 형식
-```
-::error file=Example.java,line=10,col=1,title=SQL Injection::설명
-```
-
-## 🔒 백업
-
-Push 시 자동으로 백업이 생성됩니다:
-- 위치: `backup/backup_YYYY-MM-DDTHH-mm-ss.json`
-- 최대 보관: 10개 (설정 변경 가능)
-
 ## 📄 라이선스
 
 MIT
