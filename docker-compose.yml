@@ -29,7 +29,8 @@ services:
       # Qdrant 서버 주소 (내부망)
       - QDRANT_HOST=qdrant-server
       - QDRANT_PORT=433
-      - QDRANT_COLLECTION=rules
+      - QDRANT_COLLECTION=rules          # 기존 가이드라인 컬렉션
+      - QDRANT_ISSUE_COLLECTION=issues   # 이슈 기반 컬렉션명 (실제 이름으로 변경)
       
       # 로깅
       - LOG_LEVEL=info

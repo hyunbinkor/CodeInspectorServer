@@ -38,6 +38,7 @@ export const config = {
     port: parseInt(process.env.QDRANT_PORT) || 443,
     https: process.env.QDRANT_HTTPS,
     collectionName: process.env.QDRANT_COLLECTION || 'rules',
+    issueCollectionName: process.env.QDRANT_ISSUE_COLLECTION || 'issues',
     vectorDimensions: 1536
   },
 

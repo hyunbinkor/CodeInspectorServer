@@ -18,25 +18,51 @@ export class QdrantRuleRepository extends IRuleRepository {
     this.initialized = false;
   }
 
-  /**
-   * 초기화
-   */
   async initialize() {
     if (this.initialized) return;
-
+  
+    // 기존 가이드라인 컬렉션 클라이언트
     this.qdrantClient = getQdrantClient();
     await this.qdrantClient.initialize();
-    
+  
+    // ✅ 이슈 컬렉션 클라이언트 (컬렉션명만 다르게)
+    const issueCollectionName = config.qdrant.issueCollectionName;
+    if (issueCollectionName && issueCollectionName !== config.qdrant.collectionName) {
+      this.issueQdrantClient = getQdrantClient({ 
+        ...config.qdrant, 
+        collectionName: issueCollectionName 
+      });
+      // 컬렉션이 없을 수도 있으니 소프트하게 초기화
+      try {
+        await this.issueQdrantClient.initialize();
+        logger.info(`✅ 이슈 컬렉션 연결: ${issueCollectionName}`);
+      } catch (e) {
+        logger.warn(`⚠️ 이슈 컬렉션 없음, 스킵: ${issueCollectionName}`);
+        this.issueQdrantClient = null;
+      }
+    }
+  
     this.initialized = true;
-    logger.info('✅ QdrantRuleRepository 초기화 완료');
   }
-
-  /**
-   * 전체 규칙 조회
-   */
+  
   async findAll(filters = {}) {
     await this.ensureInitialized();
-    return this.qdrantClient.getAllRules(filters);
+  
+    // ✅ 두 컬렉션 병렬 조회 후 합산
+    const [guidelineRules, issueRules] = await Promise.all([
+      this.qdrantClient.getAllRules(filters),
+      this.issueQdrantClient 
+        ? this.issueQdrantClient.getAllRules(filters).catch(e => {
+            logger.warn(`이슈 컬렉션 조회 실패, 빈 배열 반환: ${e.message}`);
+            return [];
+          })
+        : Promise.resolve([])
+    ]);
+  
+    const merged = [...guidelineRules, ...issueRules];
+    logger.info(`[Repository] 전체 규칙: 가이드라인 ${guidelineRules.length}개 + 이슈 ${issueRules.length}개 = ${merged.length}개`);
+  
+    return merged;
   }
 
   /**
