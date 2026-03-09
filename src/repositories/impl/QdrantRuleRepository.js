@@ -10,6 +10,7 @@
 import { IRuleRepository } from '../IRuleRepository.js';
 import { getQdrantClient } from '../../core/clients/qdrantClient.js';
 import logger from '../../utils/loggerUtils.js';
+import { config } from '../../config/index.js';
 
 export class QdrantRuleRepository extends IRuleRepository {
   constructor() {
