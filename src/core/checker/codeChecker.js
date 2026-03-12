@@ -1564,7 +1564,7 @@ ${rulesDescription}
     }
   
     // Step 4: 사전 필터링
-    const filterResult = this.preFilterRules(code, astAnalysis, matchedRules);
+    const filterResult = this.preFilterRules(code, astAnalysis, matchedRules, tags);
   
     // Step 5: pure_regex 위반 수집
     const issues = [...filterResult.pureRegexViolations];
