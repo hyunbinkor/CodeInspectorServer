@@ -1,10 +1,17 @@
 /**
  * 청크 결과 통합 및 SARIF 출력
- * 
+ *
  * 청크별로 검사된 결과를 통합하고,
  * 라인 번호를 원본 파일 기준으로 변환하며,
  * SARIF 형식으로 출력
- * 
+ *
+ * 변경사항:
+ * - [Fix] convertLineNumbers(): 기존 공식 chunk.lineRange.start + issue.line - 1 은
+ *   codeWithHeader의 import 헤더 줄 수를 무시하므로 라인이 뒤로 밀리고
+ *   파일 총 라인 수를 초과하는 번호가 발생함.
+ *   올바른 공식: rangeStart + (issue.line - headerLineCount) - 1
+ *   + 메서드 범위 내로 클램핑 처리 추가
+ *
  * @module chunker/chunkResultMerger
  */
 
@@ -19,10 +26,10 @@ export class ChunkResultMerger {
 
   /**
    * 청크별 결과를 통합
-   * 
-   * @param {Array} chunkResults - 청크별 검사 결과 배열
-   * @param {Object} chunkingInfo - 청킹 정보 (chunks, metadata)
-   * @param {Object} options - 옵션
+   *
+   * @param {Array}  chunkResults  - 청크별 검사 결과 배열
+   * @param {Object} chunkingInfo  - 청킹 정보 (chunks, metadata)
+   * @param {Object} options       - 옵션
    * @returns {Object} 통합된 결과
    */
   merge(chunkResults, chunkingInfo, options = {}) {
@@ -31,7 +38,6 @@ export class ChunkResultMerger {
     let totalLlmCalls = 0;
     let totalProcessingTime = 0;
 
-    // 청크별 결과 수집
     for (const result of chunkResults) {
       if (!result) continue;
 
@@ -40,76 +46,111 @@ export class ChunkResultMerger {
 
       // 라인 번호 변환 (청크 내 → 원본)
       const convertedIssues = this.convertLineNumbers(result.issues || [], chunk);
-      
+
       // 컨텍스트 정보 추가
       const enrichedIssues = convertedIssues.map(issue => ({
         ...issue,
         context: {
-          className: chunk.className,
+          className:  chunk.className,
           methodName: chunk.methodName,
           chunkIndex: chunk.index,
-          chunkType: chunk.type
+          chunkType:  chunk.type
         }
       }));
 
       allIssues.push(...enrichedIssues);
 
       processedChunks.push({
-        index: chunk.index,
-        type: chunk.type,
-        methodName: chunk.methodName,
-        lineRange: chunk.lineRange,
-        issuesFound: enrichedIssues.length,
+        index:          chunk.index,
+        type:           chunk.type,
+        methodName:     chunk.methodName,
+        lineRange:      chunk.lineRange,
+        issuesFound:    enrichedIssues.length,
         processingTime: result.processingTime || 0
       });
 
-      totalLlmCalls += result.llmCalls || 0;
+      totalLlmCalls       += result.llmCalls       || 0;
       totalProcessingTime += result.processingTime || 0;
     }
 
-    // 중복 제거
     const uniqueIssues = this.deduplicateIssues(allIssues);
-
-    // 정렬 (라인 번호 순)
     uniqueIssues.sort((a, b) => (a.line || 0) - (b.line || 0));
-
-    // 요약 생성
     const summary = this.generateSummary(uniqueIssues, chunkingInfo);
 
     return {
       file: {
-        name: chunkingInfo.metadata.fileName,
+        name:       chunkingInfo.metadata.fileName,
         totalLines: chunkingInfo.metadata.totalLines,
-        className: chunkingInfo.className
+        className:  chunkingInfo.className
       },
       processing: {
-        chunked: true,
-        totalChunks: chunkingInfo.metadata.totalChunks,
+        chunked:         true,
+        totalChunks:     chunkingInfo.metadata.totalChunks,
         processedChunks: processedChunks.length,
-        totalMethods: chunkingInfo.metadata.totalMethods,
-        processingTime: totalProcessingTime,
-        llmCalls: totalLlmCalls
+        totalMethods:    chunkingInfo.metadata.totalMethods,
+        processingTime:  totalProcessingTime,
+        llmCalls:        totalLlmCalls
       },
-      issues: uniqueIssues,
-      chunks: processedChunks,
+      issues:  uniqueIssues,
+      chunks:  processedChunks,
       summary
     };
   }
 
   /**
-   * 라인 번호 변환 (청크 내 → 원본)
+   * 라인 번호 변환 (codeWithHeader 기준 → 원본 파일 기준)
+   *
+   * ┌─ codeWithHeader 구조 ───────────────────────────────────────────┐
+   * │  line 1 ~ headerLineCount   : import 블록 + "// Class: X" 주석  │
+   * │  line headerLineCount+1 ~   : 실제 메서드 코드                   │
+   * │                               ↑ 이 줄이 lineRange.start 에 대응 │
+   * └────────────────────────────────────────────────────────────────-┘
+   *
+   * 올바른 공식: rangeStart + (issue.line - headerLineCount) - 1
+   *
+   * 기존 공식:   rangeStart + issue.line - 1
+   *   → headerLineCount(import 줄 수 + 3) 만큼 라인이 뒤로 밀림
+   *   → 파일 총 라인 수를 초과하는 번호 발생
+   *
+   * 예시 (import 30줄, 메서드 원본 500번 줄):
+   *   headerText = 30줄 + '\n\n// Class...\n\n' → headerLineCount = 33
+   *   LLM이 codeWithHeader 기준 line 40 리포트
+   *   - 기존: 500 + 40 - 1        = 539  ✗
+   *   - 수정: 500 + (40 - 33) - 1 = 506  ✓
    */
   convertLineNumbers(issues, chunk) {
+    const headerLineCount = chunk.headerLineCount || 0;
+    const rangeStart      = chunk.lineRange?.start || 1;
+    const rangeEnd        = chunk.lineRange?.end   || rangeStart;
+
     return issues.map(issue => {
-      // 청크 내 라인 번호를 원본 라인 번호로 변환
-      const originalLine = issue.line 
-        ? chunk.lineRange.start + issue.line - 1
-        : chunk.lineRange.start;
+      let originalLine;
+
+      if (!issue.line) {
+        // 라인 정보 없음 → 메서드 시작 라인으로 대체
+        originalLine = rangeStart;
+      } else if (headerLineCount > 0) {
+        // codeWithHeader 사용 청크: 헤더 오프셋 제거
+        originalLine = rangeStart + (issue.line - headerLineCount) - 1;
+      } else {
+        // chunk.code 만 사용한 경우 (headerLineCount = 0): 기존 공식 유지
+        originalLine = rangeStart + issue.line - 1;
+      }
+
+      // 클램핑: 메서드 범위 내로 제한 (음수 / 범위 초과 방지)
+      const clampedLine = Math.max(rangeStart, Math.min(originalLine, rangeEnd));
+
+      if (originalLine !== clampedLine) {
+        logger.debug(
+          `[convertLineNumbers] 라인 클램핑: ${originalLine} → ${clampedLine} ` +
+          `(method: ${chunk.methodName}, range: ${rangeStart}-${rangeEnd})`
+        );
+      }
 
       return {
         ...issue,
-        line: originalLine,
-        chunkLine: issue.line  // 원본 청크 내 라인 번호 보존
+        line:      clampedLine,
+        chunkLine: issue.line   // 디버깅용: codeWithHeader 기준 원래 값
       };
     });
   }
@@ -119,12 +160,9 @@ export class ChunkResultMerger {
    */
   deduplicateIssues(issues) {
     const seen = new Map();
-
     return issues.filter(issue => {
       const key = `${issue.ruleId}-${issue.line}-${issue.description?.substring(0, 50) || ''}`;
-      if (seen.has(key)) {
-        return false;
-      }
+      if (seen.has(key)) return false;
       seen.set(key, true);
       return true;
     });
@@ -135,48 +173,35 @@ export class ChunkResultMerger {
    */
   generateSummary(issues, chunkingInfo) {
     const bySeverity = {};
-    const byClass = {};
-    const byMethod = {};
+    const byClass    = {};
+    const byMethod   = {};
     const byCategory = {};
 
     for (const issue of issues) {
-      // 심각도별
-      const severity = issue.severity || 'MEDIUM';
-      bySeverity[severity] = (bySeverity[severity] || 0) + 1;
-
-      // 클래스별
-      const className = issue.context?.className || 'unknown';
-      byClass[className] = (byClass[className] || 0) + 1;
-
-      // 메서드별
+      const severity = issue.severity           || 'MEDIUM';
+      const className  = issue.context?.className  || 'unknown';
       const methodName = issue.context?.methodName || 'unknown';
+      const category   = issue.category            || 'general';
+
+      bySeverity[severity] = (bySeverity[severity] || 0) + 1;
+      byClass[className]   = (byClass[className]   || 0) + 1;
+      byCategory[category] = (byCategory[category] || 0) + 1;
+
       if (methodName !== 'unknown') {
         byMethod[methodName] = (byMethod[methodName] || 0) + 1;
       }
-
-      // 카테고리별
-      const category = issue.category || 'general';
-      byCategory[category] = (byCategory[category] || 0) + 1;
     }
 
-    return {
-      totalIssues: issues.length,
-      bySeverity,
-      byClass,
-      byMethod,
-      byCategory
-    };
+    return { totalIssues: issues.length, bySeverity, byClass, byMethod, byCategory };
   }
+
+  // ─── SARIF 출력 ─────────────────────────────────────────────────────────────
 
   /**
    * SARIF 형식으로 변환
-   * 
-   * @param {Object} mergedResult - merge() 결과
-   * @param {Object} options - 변환 옵션
-   * @returns {Object} SARIF JSON
    */
   toSARIF(mergedResult, options = {}) {
-    const rules = this.extractRules(mergedResult.issues);
+    const rules   = this.extractRules(mergedResult.issues);
     const results = this.convertToSARIFResults(mergedResult.issues, mergedResult.file);
 
     return {
@@ -185,52 +210,40 @@ export class ChunkResultMerger {
       runs: [{
         tool: {
           driver: {
-            name: this.toolName,
-            version: this.toolVersion,
+            name:           this.toolName,
+            version:        this.toolVersion,
             informationUri: this.toolUri,
-            rules: rules
+            rules
           }
         },
-        results: results,
+        results,
         invocations: [{
           executionSuccessful: true,
           startTimeUtc: mergedResult.processing?.startTime || new Date().toISOString(),
-          endTimeUtc: new Date().toISOString(),
+          endTimeUtc:   new Date().toISOString(),
           properties: {
-            chunked: mergedResult.processing?.chunked || false,
-            totalChunks: mergedResult.processing?.totalChunks || 1,
-            totalMethods: mergedResult.processing?.totalMethods || 0,
+            chunked:         mergedResult.processing?.chunked      || false,
+            totalChunks:     mergedResult.processing?.totalChunks  || 1,
+            totalMethods:    mergedResult.processing?.totalMethods  || 0,
             processingTimeMs: mergedResult.processing?.processingTime || 0,
-            llmCalls: mergedResult.processing?.llmCalls || 0
+            llmCalls:        mergedResult.processing?.llmCalls     || 0
           }
         }],
-        properties: {
-          summary: mergedResult.summary
-        }
+        properties: { summary: mergedResult.summary }
       }]
     };
   }
 
-  /**
-   * 이슈에서 규칙 정의 추출
-   */
   extractRules(issues) {
     const rulesMap = new Map();
-
     for (const issue of issues) {
       if (!rulesMap.has(issue.ruleId)) {
         rulesMap.set(issue.ruleId, {
-          id: issue.ruleId,
+          id:   issue.ruleId,
           name: this.ruleIdToName(issue.ruleId),
-          shortDescription: {
-            text: issue.title || issue.ruleId
-          },
-          fullDescription: {
-            text: issue.description || issue.title || issue.ruleId
-          },
-          defaultConfiguration: {
-            level: this.severityToLevel(issue.severity)
-          },
+          shortDescription: { text: issue.title || issue.ruleId },
+          fullDescription:  { text: issue.description || issue.title || issue.ruleId },
+          defaultConfiguration: { level: this.severityToLevel(issue.severity) },
           properties: {
             category: issue.category || 'general',
             tags: [issue.category || 'general', issue.checkType || 'llm']
@@ -238,32 +251,26 @@ export class ChunkResultMerger {
         });
       }
     }
-
     return Array.from(rulesMap.values());
   }
 
-  /**
-   * SARIF 결과 배열로 변환
-   */
   convertToSARIFResults(issues, fileInfo) {
-    return issues.map((issue, index) => ({
-      ruleId: issue.ruleId,
+    return issues.map((issue) => ({
+      ruleId:    issue.ruleId,
       ruleIndex: this.getRuleIndex(issues, issue.ruleId),
-      level: this.severityToLevel(issue.severity),
-      message: {
-        text: issue.description || issue.title || 'Unknown issue'
-      },
+      level:     this.severityToLevel(issue.severity),
+      message:   { text: issue.description || issue.title || 'Unknown issue' },
       locations: [{
         physicalLocation: {
           artifactLocation: {
-            uri: fileInfo.name,
+            uri:       fileInfo.name,
             uriBaseId: '%SRCROOT%'
           },
           region: {
-            startLine: issue.line || 1,
-            startColumn: issue.column || 1,
-            endLine: issue.endLine || issue.line || 1,
-            endColumn: issue.endColumn || 1
+            startLine:   issue.line      || 1,
+            startColumn: issue.column    || 1,
+            endLine:     issue.endLine   || issue.line || 1,
+            endColumn:   issue.endColumn || 1
           }
         },
         logicalLocations: this.buildLogicalLocations(issue, fileInfo)
@@ -271,145 +278,98 @@ export class ChunkResultMerger {
       properties: {
         confidence: issue.confidence || 0.8,
         suggestion: issue.suggestion || null,
-        context: issue.context || null,
-        checkType: issue.checkType || 'llm'
+        context:    issue.context    || null,
+        checkType:  issue.checkType  || 'llm'
       },
-      fixes: issue.suggestion ? [{
-        description: {
-          text: issue.suggestion
-        }
-      }] : undefined
+      fixes: issue.suggestion
+        ? [{ description: { text: issue.suggestion } }]
+        : undefined
     }));
   }
 
-  /**
-   * 논리적 위치 빌드 (클래스, 메서드)
-   */
   buildLogicalLocations(issue, fileInfo) {
     const locations = [];
-
     if (issue.context?.className) {
       locations.push({
-        name: issue.context.className,
-        kind: 'type',
+        name:               issue.context.className,
+        kind:               'type',
         fullyQualifiedName: issue.context.className
       });
     }
-
     if (issue.context?.methodName) {
       locations.push({
-        name: issue.context.methodName,
-        kind: 'function',
+        name:               issue.context.methodName,
+        kind:               'function',
         fullyQualifiedName: `${issue.context.className || fileInfo.className}.${issue.context.methodName}`
       });
     }
-
     return locations.length > 0 ? locations : undefined;
   }
 
-  /**
-   * 규칙 인덱스 조회
-   */
   getRuleIndex(issues, ruleId) {
     const uniqueRuleIds = [...new Set(issues.map(i => i.ruleId))];
     return uniqueRuleIds.indexOf(ruleId);
   }
 
-  /**
-   * ruleId를 이름으로 변환
-   */
   ruleIdToName(ruleId) {
-    // ERR.3_2 → EmptyCatchBlock
     const parts = ruleId.split('.');
-    if (parts.length >= 2) {
-      return parts.join('_').replace(/[^a-zA-Z0-9_]/g, '');
-    }
+    if (parts.length >= 2) return parts.join('_').replace(/[^a-zA-Z0-9_]/g, '');
     return ruleId.replace(/[^a-zA-Z0-9]/g, '');
   }
 
-  /**
-   * 심각도를 SARIF 레벨로 변환
-   */
   severityToLevel(severity) {
-    const mapping = {
-      'CRITICAL': 'error',
-      'HIGH': 'error',
-      'MEDIUM': 'warning',
-      'LOW': 'note',
-      'INFO': 'note'
-    };
+    const mapping = { CRITICAL: 'error', HIGH: 'error', MEDIUM: 'warning', LOW: 'note', INFO: 'note' };
     return mapping[severity] || 'warning';
   }
 
-  /**
-   * GitHub Actions 어노테이션 형식으로 변환
-   */
+  // ─── GitHub / Simple JSON ────────────────────────────────────────────────────
+
   toGitHubAnnotations(mergedResult) {
-    const annotations = [];
-
-    for (const issue of mergedResult.issues) {
-      const level = this.severityToGitHubLevel(issue.severity);
-      const file = mergedResult.file.name;
-      const line = issue.line || 1;
-      const col = issue.column || 1;
-      const title = `${issue.title || issue.ruleId} (${issue.ruleId})`;
+    return mergedResult.issues.map(issue => {
+      const level   = this.severityToGitHubLevel(issue.severity);
+      const file    = mergedResult.file.name;
+      const line    = issue.line || 1;
+      const col     = issue.column || 1;
+      const title   = `${issue.title || issue.ruleId} (${issue.ruleId})`;
       const message = issue.description || issue.title;
-
-      annotations.push(`::${level} file=${file},line=${line},col=${col},title=${title}::${message}`);
-    }
-
-    return annotations.join('\n');
+      return `::${level} file=${file},line=${line},col=${col},title=${title}::${message}`;
+    }).join('\n');
   }
 
-  /**
-   * 심각도를 GitHub 레벨로 변환
-   */
   severityToGitHubLevel(severity) {
-    const mapping = {
-      'CRITICAL': 'error',
-      'HIGH': 'error',
-      'MEDIUM': 'warning',
-      'LOW': 'notice',
-      'INFO': 'notice'
-    };
+    const mapping = { CRITICAL: 'error', HIGH: 'error', MEDIUM: 'warning', LOW: 'notice', INFO: 'notice' };
     return mapping[severity] || 'warning';
   }
 
-  /**
-   * 간단한 JSON 형식으로 변환 (기존 호환)
-   */
   toSimpleJSON(mergedResult) {
     return {
-      fileName: mergedResult.file.name,
-      totalLines: mergedResult.file.totalLines,
-      chunked: mergedResult.processing.chunked,
-      totalChunks: mergedResult.processing.totalChunks,
-      totalMethods: mergedResult.processing.totalMethods,
+      fileName:       mergedResult.file.name,
+      totalLines:     mergedResult.file.totalLines,
+      chunked:        mergedResult.processing.chunked,
+      totalChunks:    mergedResult.processing.totalChunks,
+      totalMethods:   mergedResult.processing.totalMethods,
       processingTime: mergedResult.processing.processingTime,
-      llmCalls: mergedResult.processing.llmCalls,
+      llmCalls:       mergedResult.processing.llmCalls,
       issues: mergedResult.issues.map(issue => ({
-        ruleId: issue.ruleId,
-        title: issue.title,
-        line: issue.line,
-        severity: issue.severity,
+        ruleId:      issue.ruleId,
+        title:       issue.title,
+        line:        issue.line,
+        severity:    issue.severity,
         description: issue.description,
-        suggestion: issue.suggestion,
-        category: issue.category,
-        className: issue.context?.className,
-        methodName: issue.context?.methodName
+        suggestion:  issue.suggestion,
+        category:    issue.category,
+        className:   issue.context?.className,
+        methodName:  issue.context?.methodName
       })),
       summary: mergedResult.summary
     };
   }
 }
 
-// 싱글톤
 let instance = null;
 
 export function getChunkResultMerger() {
-  if (!instance) {
-    instance = new ChunkResultMerger();
-  }
+  if (!instance) instance = new ChunkResultMerger();
   return instance;
 }
 
