@@ -158,7 +158,7 @@ export class LLMClient {
    * @private
    */
   _buildRequestParams(prompt, options) {
-    const maxTokens = options.max_tokens || options.num_predict || 2000;
+    const maxTokens = options.max_tokens || options.num_predict || 10000;
     const temperature = options.temperature ?? 0.1;
     
     return {

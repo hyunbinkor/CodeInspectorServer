@@ -4,6 +4,9 @@
  * 기존 qdrantClient.js를 IRuleRepository 인터페이스로 래핑
  * DB 교체 시 이 파일만 다른 구현체로 교체하면 됨
  * 
+ * 변경사항:
+ * - [Fix #1 #5] findByTags()에서 가이드라인 + 이슈 컬렉션 병합 (findAll과 동일 메커니즘)
+ * 
  * @module repositories/impl/QdrantRuleRepository
  */
 
@@ -16,6 +19,7 @@ export class QdrantRuleRepository extends IRuleRepository {
   constructor() {
     super();
     this.qdrantClient = null;
+    this.issueQdrantClient = null;
     this.initialized = false;
   }
 
@@ -45,7 +49,10 @@ export class QdrantRuleRepository extends IRuleRepository {
   
     this.initialized = true;
   }
-  
+
+  /**
+   * 전체 규칙 조회 (가이드라인 + 이슈 컬렉션 병합)
+   */
   async findAll(filters = {}) {
     await this.ensureInitialized();
   
@@ -76,11 +83,28 @@ export class QdrantRuleRepository extends IRuleRepository {
   }
 
   /**
-   * 태그 기반 규칙 조회
+   * 태그 기반 규칙 조회 (가이드라인 + 이슈 컬렉션 병합)
+   * 
+   * [Fix #1 #5] 기존에는 가이드라인 컬렉션만 조회하여 이슈 기반 규칙이 누락됨
+   * findAll()과 동일한 Promise.all 병합 메커니즘 적용
    */
   async findByTags(tags, options = {}) {
     await this.ensureInitialized();
-    return this.qdrantClient.findRulesByTags(tags, options);
+
+    const [guidelineRules, issueRules] = await Promise.all([
+      this.qdrantClient.findRulesByTags(tags, options),
+      this.issueQdrantClient
+        ? this.issueQdrantClient.findRulesByTags(tags, options).catch(e => {
+            logger.warn(`이슈 컬렉션 태그 조회 실패, 빈 배열 반환: ${e.message}`);
+            return [];
+          })
+        : Promise.resolve([])
+    ]);
+
+    const merged = [...guidelineRules, ...issueRules];
+    logger.info(`[Repository] 태그 매칭 규칙: 가이드라인 ${guidelineRules.length}개 + 이슈 ${issueRules.length}개 = ${merged.length}개`);
+
+    return merged;
   }
 
   /**

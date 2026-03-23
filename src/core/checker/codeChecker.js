@@ -14,6 +14,10 @@
  * - [Fix] checkCodeChunked(): checkCodeDirect 호출 시 tags 인수 전달
  * - [Fix] verifyWithLLM(): addLineNumbers()로 번호 붙인 코드 LLM 전달
  * - [Fix] buildSingleRulePrompt(): 코드 블록 헤더에 라인번호 안내 추가
+ * - [Fix #1] Repository 패턴 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
+ * - [Fix #2] matchesContextualCondition: 조건 없는 규칙 통과
+ * - [Fix #3] llm_with_regex antiPatterns 없을 때 llm_contextual 폴백
+ * - [Fix #4] limit 200 → 10000
  *
  * @module checker/codeChecker
  */
@@ -26,6 +30,7 @@ import { getJavaAstParser } from '../ast/javaAstParser.js';
 import { getResultBuilder } from './resultBuilder.js';
 import { MethodChunker }    from '../chunker/methodChunker.js';
 import { ChunkResultMerger } from '../chunker/chunkResultMerger.js';
+import { getQdrantRuleRepository } from '../../repositories/impl/QdrantRuleRepository.js';  // [Fix #1] Repository 추가
 import { listFiles, readTextFile, writeJsonFile } from '../../utils/fileUtils.js';
 import { addLineNumbers }   from '../../utils/codeUtils.js';   // ← [Fix] 추가
 import { config }           from '../../config/index.js';
@@ -42,6 +47,7 @@ export class CodeChecker {
   constructor() {
     this.codeTagger        = null;
     this.qdrantClient      = null;
+    this.ruleRepository    = null;   // [Fix #1] Repository 추가
     this.llmClient         = null;
     this.astParser         = null;
     this.resultBuilder     = null;
@@ -76,6 +82,10 @@ export class CodeChecker {
 
     this.qdrantClient = getQdrantClient();
     await this.qdrantClient.initialize();
+
+    // [Fix #1] Repository 초기화 (가이드라인 + 이슈 컬렉션 병합 조회용)
+    this.ruleRepository = getQdrantRuleRepository();
+    await this.ruleRepository.initialize();
 
     this.llmClient = getLLMClient();
     await this.llmClient.initialize();
@@ -173,7 +183,9 @@ export class CodeChecker {
     const astAnalysis = astResult.analysis;
 
     logger.debug(`[${fileName}] 룰 조회...`);
-    const matchedRules = await this.qdrantClient.findRulesByTags(tags, { limit: 200, scoreThreshold: 0.3 });
+    // [Fix #1] Repository 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
+    // [Fix #4] limit 200 → 10000
+    const matchedRules = await this.ruleRepository.findByTags(tags, { limit: 10000, scoreThreshold: 0.3 });
     logger.info(`[${fileName}] 매칭 룰: ${matchedRules.length}개`);
 
     onProgress({ stage: 'rules', status: 'done', matchedRules: matchedRules.length, elapsed: Date.now() - startTime });
@@ -348,9 +360,10 @@ export class CodeChecker {
     const astAnalysis = astResult.analysis;
 
     // Step 3: 태그 기반 룰 조회
-    // [Fix] limit 50 → 200 (청크 단위 검사이므로 더 많은 룰 커버)
-    const matchedRules = await this.qdrantClient.findRulesByTags(tags, {
-      limit:          200,
+    // [Fix #1] Repository 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
+    // [Fix #4] limit 200 → 10000
+    const matchedRules = await this.ruleRepository.findByTags(tags, {
+      limit:          10000,
       scoreThreshold: 0.3
     });
 
@@ -414,6 +427,13 @@ export class CodeChecker {
           if (candidates.length > 0) {
             llmCandidates.llm_with_regex.push({ rule, candidates });
             llmCandidates.total += 1;
+          } else if (!rule.antiPatterns || rule.antiPatterns.length === 0) {
+            // [Fix #3] antiPatterns 없거나 파싱 실패 → llm_contextual로 폴백
+            logger.info(`[preFilter] ${rule.ruleId}: llm_with_regex → llm_contextual 폴백 (antiPatterns 없음/파싱실패)`);
+            if (this.matchesContextualCondition(sourceCode, rule, tagSet)) {
+              llmCandidates.llm_contextual.push({ rule });
+              llmCandidates.total += 1;
+            }
           }
           break;
         }
@@ -467,21 +487,18 @@ export class CodeChecker {
 
             violations.push({
               ruleId:      rule.ruleId,
-              title:       rule.title,
+              title:       rule.title || '',
               line:        lineNumber,
-              column:      match.index - beforeMatch.lastIndexOf('\n'),
               severity:    rule.severity || 'MEDIUM',
-              description: antiPattern.description || rule.description,
-              suggestion:  rule.examples?.good?.[0] || rule.suggestion || '패턴을 수정하세요',
-              category:    rule.category  || 'general',
+              description: antiPattern.description || rule.description || '',
+              suggestion:  rule.suggestion || '',
+              category:    rule.category || 'general',
               checkType:   'pure_regex',
               source:      'code_checker_regex'
             });
-
-            if (violations.filter(v => v.ruleId === rule.ruleId).length >= 5) break;
           }
         } catch (error) {
-          logger.warn(`정규식 오류 [${rule.ruleId}]: ${error.message}`);
+          logger.warn(`pure_regex 오류 [${rule.ruleId}]: ${error.message}`);
         }
       }
     }
@@ -552,9 +569,47 @@ export class CodeChecker {
       if (allPresent) return true;
     }
     if (rule.tagCondition) {
-      return this.qdrantClient.evaluateExpression(rule.tagCondition, tagSet);
+      // [Fix #1] qdrantClient.evaluateExpression → 내부 메서드 사용
+      return this._evaluateTagExpression(rule.tagCondition, tagSet);
     }
-    return false;
+    // [Fix #2] 조건이 없는 규칙은 통과 (1차 필터인 evaluateTagCondition을 이미 통과한 규칙)
+    // 기존: return false → 조건 미설정 llm_contextual 규칙이 전부 탈락됨
+    return true;
+  }
+
+  /**
+   * 태그 표현식 평가 (AND, OR, NOT, 괄호 지원)
+   * qdrantClient.evaluateExpression()과 동일 로직을 내재화
+   * 
+   * @param {string} expression - 태그 표현식 (예: "USES_CONNECTION && !HAS_TRY_WITH_RESOURCES")
+   * @param {Set<string>} tagSet - 태그 Set
+   * @returns {boolean}
+   * @private
+   */
+  _evaluateTagExpression(expression, tagSet) {
+    if (!expression || typeof expression !== 'string') {
+      return true;
+    }
+
+    try {
+      let evalExpr = expression
+        .replace(/&&/g, ' && ')
+        .replace(/\|\|/g, ' || ')
+        .replace(/!/g, ' ! ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const tagPattern = /\b([A-Z][A-Z0-9_]*)\b/g;
+      evalExpr = evalExpr.replace(tagPattern, (match) => {
+        return tagSet.has(match) ? 'true' : 'false';
+      });
+
+      const result = new Function(`return (${evalExpr})`)();
+      return Boolean(result);
+    } catch (error) {
+      logger.warn(`표현식 평가 실패: ${expression}`, error.message);
+      return false;
+    }
   }
 
   matchesAstCondition(sourceCode, astAnalysis, rule) {
@@ -634,9 +689,6 @@ export class CodeChecker {
     const truncatedCode = this.truncateCode(sourceCode, 4000);
 
     // ✅ [Fix] LLM에게 라인 번호가 붙은 코드를 전달
-    //   - raw 코드를 전달하면 LLM이 줄을 잘못 셀 수 있음
-    //   - 1부터 시작하는 번호를 붙여 codeWithHeader 기준 번호와 일치시킴
-    //   - convertLineNumbers()가 headerLineCount 오프셋으로 원본 라인으로 변환함
     const numberedCode = addLineNumbers(truncatedCode, 1);
 
     for (let i = 0; i < allItems.length; i++) {
@@ -719,8 +771,6 @@ export class CodeChecker {
    * 단일 규칙 검증 프롬프트
    *
    * sourceCode 는 addLineNumbers() 로 이미 번호가 붙어 있음.
-   * LLM이 "줄 앞의 숫자 = 라인 번호" 임을 명시하여
-   * 리포트된 line 값이 convertLineNumbers() 변환 후 정확한 원본 라인이 되도록 함.
    */
   buildSingleRulePrompt(sourceCode, item, astAnalysis, tags) {
     const rule = item.rule;
@@ -745,128 +795,45 @@ ${sourceCode}
 \`\`\`
 주의: line 필드에는 위 코드에 표시된 라인 번호를 그대로 입력하세요.
 
-## 검사할 규칙
-- **규칙 ID:** ${rule.ruleId}
-- **제목:** ${rule.title}
-- **설명:** ${rule.description || '없음'}
-- **카테고리:** ${rule.category || 'general'}
-- **심각도:** ${rule.severity || 'MEDIUM'}
+## 검사 규칙
+- ID: ${rule.ruleId}
+- 제목: ${rule.title}
+- 설명: ${rule.description || ''}
+- 심각도: ${rule.severity || 'MEDIUM'}
 ${examplesSection}
 ${contextSection}
 ${falsePositiveGuide}
 
-## 출력 형식 (JSON)
+## 응답 형식 (JSON)
 \`\`\`json
 {
   "violation": true 또는 false,
-  "line": 위반 라인 번호 (위반인 경우, 위 코드의 줄 번호 그대로),
+  "title": "위반 제목",
+  "line": 위반 라인 번호 (없으면 0),
   "description": "구체적인 위반 내용",
   "suggestion": "수정 제안",
-  "confidence": 0.0~1.0
+  "confidence": 0.0 ~ 1.0
 }
 \`\`\`
 
-## 최종 판단 기준
-1. **확실한 위반만** violation: true 반환 (confidence 0.8 이상)
-2. 애매하거나 불확실하면 violation: false
-3. goodPatterns에 매칭되면 violation: false
-4. 거짓 양성 조건에 해당하면 violation: false
-5. 위반이 아니면 간단히 {"violation": false} 반환
-
-JSON만 출력하세요.`;
+위반이 없으면 "violation": false로 응답하세요.`;
   }
 
   _buildAstSection(astAnalysis) {
     if (!astAnalysis) return '';
-
-    const classes = astAnalysis.classDeclarations?.map(c => {
-      let info = c.name;
-      if (c.extends) info += ` extends ${c.extends}`;
-      if (c.implements?.length) info += ` implements ${c.implements.join(', ')}`;
-      return info;
-    }).join(', ') || 'N/A';
-
-    const methods = astAnalysis.methodDeclarations?.slice(0, 8).map(m =>
-      `${m.returnType} ${m.name}(${m.parameters || ''})`
-    ) || [];
-    const methodList  = methods.length > 0 ? methods.map(m => `  - ${m}`).join('\n') : '  - N/A';
-    const methodExtra = (astAnalysis.methodDeclarations?.length || 0) > 8
-      ? `\n  - ... 외 ${astAnalysis.methodDeclarations.length - 8}개` : '';
-
-    const annotations     = astAnalysis.annotations?.slice(0, 10).join(', ') || 'N/A';
-    const annotationExtra = (astAnalysis.annotations?.length || 0) > 10
-      ? `, ... 외 ${astAnalysis.annotations.length - 10}개` : '';
-
-    const depth      = astAnalysis.maxDepth              || 0;
-    const complexity = astAnalysis.cyclomaticComplexity  || 1;
-
-    return `
-## 코드 구조 정보 (AST 분석)
-- **클래스:** ${classes}
-- **메서드:**
-${methodList}${methodExtra}
-- **어노테이션:** ${annotations}${annotationExtra}
-- **복잡도:** 중첩 깊이 ${depth}, 순환 복잡도 ${complexity}`;
+    const parts = [];
+    if (astAnalysis.cyclomaticComplexity) parts.push(`- 순환 복잡도: ${astAnalysis.cyclomaticComplexity}`);
+    if (astAnalysis.maxNestingDepth) parts.push(`- 최대 중첩 깊이: ${astAnalysis.maxNestingDepth}`);
+    if (astAnalysis.methodCount) parts.push(`- 메서드 수: ${astAnalysis.methodCount}`);
+    return parts.length > 0 ? `\n## AST 분석 정보\n${parts.join('\n')}` : '';
   }
 
   _buildDetectedIssuesSection(astAnalysis, rule) {
-    if (!astAnalysis) return '';
-
-    const relevantIssues = [];
-    const combinedText   = `${rule.category || ''} ${rule.title || ''} ${rule.description || ''}`.toLowerCase();
-
-    if (combinedText.includes('exception') || combinedText.includes('error') ||
-        combinedText.includes('예외') || combinedText.includes('catch')) {
-      if (astAnalysis.exceptionHandling?.length > 0) {
-        relevantIssues.push(...astAnalysis.exceptionHandling.map(e => ({
-          type: e.type, description: e.description, severity: e.severity || 'MEDIUM'
-        })));
-      }
-    }
-
-    if (combinedText.includes('resource') || combinedText.includes('memory') ||
-        combinedText.includes('리소스')   || combinedText.includes('close') ||
-        combinedText.includes('connection') || combinedText.includes('stream')) {
-      const leaks = (astAnalysis.resourceLifecycles || [])
-        .filter(r => !r.hasCloseCall && !r.inTryWithResources);
-      if (leaks.length > 0) {
-        relevantIssues.push(...leaks.map(r => ({
-          type: 'RESOURCE_LEAK_RISK', description: `${r.type} 리소스 해제 누락 가능성`, severity: 'HIGH'
-        })));
-      }
-    }
-
-    if (combinedText.includes('security') || combinedText.includes('보안') ||
-        combinedText.includes('sql') || combinedText.includes('injection')) {
-      if (astAnalysis.securityPatterns?.length > 0) {
-        relevantIssues.push(...astAnalysis.securityPatterns);
-      }
-    }
-
-    if (combinedText.includes('performance') || combinedText.includes('성능') ||
-        combinedText.includes('loop') || combinedText.includes('반복')) {
-      if (astAnalysis.performanceIssues?.length > 0) {
-        relevantIssues.push(...astAnalysis.performanceIssues);
-      }
-      if (astAnalysis.loopAnalysis?.hasDbCallInLoop) {
-        relevantIssues.push({ type: 'DB_CALL_IN_LOOP', description: '루프 내 DB 호출 감지 (N+1 쿼리 위험)', severity: 'HIGH' });
-      }
-      if (astAnalysis.loopAnalysis?.hasNestedLoop) {
-        relevantIssues.push({ type: 'NESTED_LOOP', description: '중첩 루프 감지 (성능 저하 가능)', severity: 'MEDIUM' });
-      }
-    }
-
-    if (relevantIssues.length === 0) return '';
-
-    const issueList = relevantIssues.slice(0, 5).map(i =>
-      `- **${i.type}**: ${i.description} (${i.severity})`
-    ).join('\n');
-
-    return `
-## AST 자동 탐지 이슈 (참고)
-${issueList}
-
-위 이슈는 AST 분석으로 자동 탐지되었습니다. 규칙 위반 판단 시 참고하세요.`;
+    if (!astAnalysis?.detectedIssues) return '';
+    const relevant = astAnalysis.detectedIssues.filter(i => i.ruleId === rule.ruleId);
+    if (relevant.length === 0) return '';
+    const items = relevant.map(i => `- 라인 ${i.line}: ${i.description}`).join('\n');
+    return `\n## AST가 감지한 관련 이슈\n${items}\n\n규칙 위반 판단 시 참고하세요.`;
   }
 
   _buildProfileSection(tags) {
