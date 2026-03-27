@@ -6,6 +6,12 @@
  * - tier 2: LLM 기반 컨텍스트 태그 추출 (선택적)
  * - 복합 태그: 기본 태그 조합으로 자동 계산
  * 
+ * 변경사항:
+ * - [Fix C] loadPatternsFromJSON(): PCRE→JS 변환 추가
+ * - [Fix #2] extractByAst(): parse() → parseJavaCode()로 통일
+ * - [Fix #6] extractByRegex(): regex.lastIndex 매칭 전후 전체 리셋
+ * - [Fix #9] loadPatternsFromJSON(): matchType='none' 태그는 compiledPatterns에서 제외
+ * 
  * @module tagger/codeTagger
  */
 
@@ -52,20 +58,40 @@ export class CodeTagger {
 
   /**
    * JSON에서 패턴 로드 및 컴파일
+   * 
+   * [Fix C] PCRE→JS 변환 추가
+   *   기존: new RegExp(patternStr, config.flags || 'g')
+   *     → (?m), (?i), (?s) 등 PCRE 인라인 플래그에서 SyntaxError → 조용히 스킵
+   *   수정: _convertPCREtoJS()로 인라인 플래그를 JS flags로 변환 후 RegExp 생성
    */
   loadPatternsFromJSON() {
     // 1. 정규식 패턴 로드 및 컴파일
     const regexPatterns = this.tagLoader.getRegexTagPatterns();
     for (const [tagName, config] of regexPatterns) {
+      // [Fix #9] matchType이 'none'이면 컴파일 자체를 건너뜀 (CONTEXT_DOCUMENT 등)
+      if (config.matchType === 'none') {
+        logger.debug(`정규식 스킵 [${tagName}]: matchType=none`);
+        continue;
+      }
+
       const compiledRegexes = [];
       
       for (const patternStr of config.patterns) {
         try {
-          // 패턴 문자열을 RegExp로 컴파일
-          const regex = new RegExp(patternStr, config.flags || 'g');
+          // [Fix C] PCRE→JS 변환 후 RegExp 생성
+          const converted = this._convertPCREtoJS(patternStr, config.flags || 'g');
+          const regex = new RegExp(converted.pattern, converted.flags);
           compiledRegexes.push(regex);
         } catch (error) {
-          logger.warn(`정규식 컴파일 실패 [${tagName}]: ${patternStr} - ${error.message}`);
+          // 1차 변환 실패 시 추가 정제 시도
+          try {
+            const sanitized = this._sanitizePattern(patternStr);
+            const regex = new RegExp(sanitized, config.flags || 'g');
+            compiledRegexes.push(regex);
+            logger.warn(`정규식 정제 후 컴파일 성공 [${tagName}]: ${patternStr} → ${sanitized}`);
+          } catch (error2) {
+            logger.warn(`정규식 컴파일 실패 [${tagName}]: ${patternStr} - ${error.message}`);
+          }
         }
       }
       
@@ -86,6 +112,114 @@ export class CodeTagger {
 
     logger.debug(`패턴 로드 완료: 정규식 ${this.compiledPatterns.size}개, 메트릭 ${this.metricTags.size}개, LLM ${this.llmTags.size}개`);
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // [Fix C] PCRE→JS 변환 (qdrantClient._convertPCREtoJS와 동일 로직)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * PCRE 정규식을 JavaScript RegExp로 변환
+   * 
+   * PCRE 전용 기능을 JS 호환 형태로 변환:
+   * - (?i), (?m), (?s), (?x) 등 인라인 플래그 → JS flags로 이동
+   * - (?i:...) 등 그룹 내 플래그 → (?:...)로 변환
+   * - (?>...) atomic group → (?:...)
+   * - 소유 수량자 ++, *+, ?+ → +, *, ?
+   * - (?P<n>...) → (?<n>...) 명명 그룹
+   * - (?P=name) → \k<name> 역참조
+   * 
+   * @param {string} pattern - PCRE 패턴 문자열
+   * @param {string} flags - 기본 플래그
+   * @returns {{ pattern: string, flags: string }}
+   * @private
+   */
+  _convertPCREtoJS(pattern, flags) {
+    let newPattern = pattern;
+    let newFlags = flags;
+    
+    // Set으로 관리하여 중복 플래그 방지
+    const flagSet = new Set(newFlags.split(''));
+    
+    // 1. 선두 인라인 플래그 추출 및 제거: (?imsx)
+    const leadingMatch = newPattern.match(/^\(\?([imsx]+)\)/);
+    if (leadingMatch) {
+      const inlineFlags = leadingMatch[1];
+      newPattern = newPattern.replace(/^\(\?[imsx]+\)/, '');
+      
+      if (inlineFlags.includes('i')) flagSet.add('i');
+      if (inlineFlags.includes('m')) flagSet.add('m');
+      if (inlineFlags.includes('s')) flagSet.add('s');
+    }
+    
+    // 2. 패턴 중간의 인라인 플래그도 처리
+    // (?i:...) → (?:...) + 'i' 플래그
+    newPattern = newPattern.replace(/\(\?([imsx]+):/g, (match, inlineFlags) => {
+      if (inlineFlags.includes('i')) flagSet.add('i');
+      if (inlineFlags.includes('m')) flagSet.add('m');
+      if (inlineFlags.includes('s')) flagSet.add('s');
+      return '(?:';
+    });
+    // (?i) 중간 독립 플래그 제거
+    newPattern = newPattern.replace(/\(\?[imsx]+\)/g, '');
+    
+    // 3. Atomic groups (?>...) → (?:...)
+    newPattern = newPattern.replace(/\(\?>/g, '(?:');
+    
+    // 4. Possessive quantifiers ++, *+, ?+ → +, *, ?
+    newPattern = newPattern.replace(/\+\+/g, '+');
+    newPattern = newPattern.replace(/\*\+/g, '*');
+    newPattern = newPattern.replace(/\?\+/g, '?');
+    
+    // 5. Named groups (?P<n>...) → (?<n>...)
+    newPattern = newPattern.replace(/\(\?P</g, '(?<');
+    
+    // 6. Named backreference (?P=name) → \k<name>
+    newPattern = newPattern.replace(/\(\?P=(\w+)\)/g, '\\k<$1>');
+    
+    newFlags = Array.from(flagSet).join('');
+    
+    return { pattern: newPattern, flags: newFlags };
+  }
+
+  /**
+   * 패턴 추가 정제 (변환 후에도 실패할 경우)
+   * @private
+   */
+  _sanitizePattern(pattern) {
+    if (typeof pattern !== 'string') return '';
+    
+    let sanitized = pattern;
+    
+    // PCRE inline flags 제거
+    sanitized = sanitized.replace(/^\(\?[imsx]+\)/, '');
+    sanitized = sanitized.replace(/\(\?[imsx]+:/g, '(?:');
+    sanitized = sanitized.replace(/\(\?[imsx]+\)/g, '');
+    
+    // 짝이 맞지 않는 괄호 정리
+    let parenCount = 0;
+    let inBracket = false;
+    
+    for (let i = 0; i < sanitized.length; i++) {
+      const char = sanitized[i];
+      const prevChar = i > 0 ? sanitized[i - 1] : '';
+      
+      if (prevChar !== '\\') {
+        if (char === '[' && !inBracket) inBracket = true;
+        else if (char === ']' && inBracket) inBracket = false;
+        else if (char === '(' && !inBracket) parenCount++;
+        else if (char === ')' && !inBracket) parenCount--;
+      }
+    }
+    
+    if (parenCount > 0) sanitized += ')'.repeat(parenCount);
+    if (inBracket) sanitized += ']';
+    
+    return sanitized;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 메인: 태그 추출
+  // ═══════════════════════════════════════════════════════════════════════════
 
   /**
    * 코드에서 태그 추출 (메인 메서드)
@@ -190,20 +324,25 @@ export class CodeTagger {
       const codeToCheck = config.excludeInComments ? cleanedCode : originalCode;
       
       let matched = false;
+
+      // [Fix #6] 매칭 전 모든 regex의 lastIndex를 일괄 리셋
+      // 기존: some()/every() 내부에서 개별 리셋 → 중단 시 나머지 regex의 lastIndex 잔류
+      // 수정: 전체 리셋 후 매칭 → 다음 호출에서도 안전
+      config.patterns.forEach(r => { r.lastIndex = 0; });
       
       if (config.matchType === 'all') {
         // 모든 패턴이 매칭되어야 함
-        matched = config.patterns.every(regex => {
-          regex.lastIndex = 0; // 정규식 리셋
-          return regex.test(codeToCheck);
-        });
+        matched = config.patterns.every(regex => regex.test(codeToCheck));
+      } else if (config.matchType === 'none') {
+        // matchType이 'none'이면 매칭하지 않음 (CONTEXT_DOCUMENT 등)
+        matched = false;
       } else {
         // 하나라도 매칭되면 됨 (default: 'any')
-        matched = config.patterns.some(regex => {
-          regex.lastIndex = 0; // 정규식 리셋
-          return regex.test(codeToCheck);
-        });
+        matched = config.patterns.some(regex => regex.test(codeToCheck));
       }
+
+      // 매칭 후에도 리셋 (test가 lastIndex를 전진시키므로)
+      config.patterns.forEach(r => { r.lastIndex = 0; });
       
       if (matched) {
         tags.push(tagName);
@@ -240,36 +379,31 @@ export class CodeTagger {
     const tags = [];
     const metrics = {};
 
-    // 기본 메트릭 계산
+    // 모든 사용 가능한 메트릭을 한 번에 계산
     const lineCount = code.split('\n').length;
     const methodCount = analysis?.methodCount || this.countMethods(code);
     const complexity = analysis?.cyclomaticComplexity || this.estimateComplexity(code);
     const nestingDepth = analysis?.maxNestingDepth || this.estimateNesting(code);
+
+    const metricsMap = {
+      lineCount,
+      methodCount,
+      complexity,
+      nestingDepth
+    };
 
     metrics.lineCount = lineCount;
     metrics.methodCount = methodCount;
     metrics.complexity = complexity;
     metrics.nestingDepth = nestingDepth;
 
-    // JSON에서 로드한 threshold와 비교
+    // JSON에서 로드한 threshold와 비교 — switch 없이 동적 조회
     for (const [tagName, config] of this.metricTags) {
-      let value = 0;
+      const value = metricsMap[config.metric];
       
-      switch (config.metric) {
-        case 'lineCount':
-          value = lineCount;
-          break;
-        case 'methodCount':
-          value = methodCount;
-          break;
-        case 'complexity':
-          value = complexity;
-          break;
-        case 'nestingDepth':
-          value = nestingDepth;
-          break;
-        default:
-          continue;
+      if (value === undefined) {
+        logger.warn(`알 수 없는 메트릭: ${config.metric} (태그: ${tagName})`);
+        continue;
       }
       
       if (value >= config.threshold) {
@@ -298,7 +432,8 @@ export class CodeTagger {
    * AST 기반 태그 추출
    */
   extractByAst(code) {
-    const result = this.astParser.parse(code);
+    // [Fix #2] parse() → parseJavaCode()로 통일 (codeChecker와 동일 메서드 사용)
+    const result = this.astParser.parseJavaCode(code);
     const tags = [];
     const analysis = result.analysis;
 
@@ -722,7 +857,7 @@ export function getCodeTagger() {
 }
 
 /**
- * 싱글톤 리셋 (테스트용)
+ * 싱글톤 리셋 (테스트용 / Push 후 리로드용)
  */
 export function resetCodeTagger() {
   instance = null;

@@ -39,6 +39,7 @@ export const config = {
     https: process.env.QDRANT_HTTPS,
     collectionName: process.env.QDRANT_COLLECTION || 'rules',
     issueCollectionName: process.env.QDRANT_ISSUE_COLLECTION || 'issues',
+    tagCollectionName: process.env.QDRANT_TAG_COLLECTION || 'tag-definitions',
     vectorDimensions: 1536
   },
 

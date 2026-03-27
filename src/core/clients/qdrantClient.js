@@ -9,6 +9,7 @@
  * 
  * 변경사항:
  * - [Fix #4] findRulesByTags, searchRules의 scroll limit 1000 → 10000
+ * - [Fix #4-싱글톤] 단일 instance → 컬렉션명 기반 Map 관리 (싱글톤 오염 방지)
  * 
  * @module clients/qdrantClient
  */
@@ -18,8 +19,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { config } from '../../config/index.js';
 import logger from '../../utils/loggerUtils.js';
 
-/** @type {QdrantClient|null} */
-let instance = null;
+/** @type {Map<string, QdrantClient>} 컬렉션명 기반 인스턴스 관리 */
+const instances = new Map();
 
 export class QdrantClient {
   /**
@@ -799,45 +800,24 @@ export class QdrantClient {
       const patterns = typeof jsonStr === 'string' ? JSON.parse(jsonStr) : jsonStr;
       if (!Array.isArray(patterns)) return [];
       
+      // 원본 {pattern, flags, description} 구조를 그대로 유지
+      // RegExp 컴파일은 실제 매칭 시점(codeChecker.findRegexCandidates 등)에서 수행
+      // Pull → Admin UI → Push 과정에서 데이터가 손실되지 않도록 함
       return patterns.map(p => {
-        try {
-          let patternStr, flags, description;
-          
-          if (typeof p === 'object' && p.pattern) {
-            patternStr = p.pattern;
-            flags = p.flags || 'g';
-            description = p.description || '';
-          } else if (typeof p === 'string') {
-            patternStr = p;
-            flags = 'g';
-            description = '';
-          } else {
-            return null;
-          }
-          
-          // PCRE → JavaScript 변환
-          const converted = this._convertPCREtoJS(patternStr, flags);
-          patternStr = converted.pattern;
-          flags = converted.flags;
-          
+        if (typeof p === 'object' && p.pattern) {
           return {
-            regex: new RegExp(patternStr, flags),
-            description
+            pattern: p.pattern,
+            flags: p.flags || 'g',
+            description: p.description || ''
           };
-        } catch (e) {
-          // 변환 실패 시 추가 정제 시도
-          try {
-            const sanitized = this._sanitizePattern(p.pattern || p);
-            const flags = p.flags || 'g';
-            return {
-              regex: new RegExp(sanitized, flags),
-              description: p.description || ''
-            };
-          } catch (e2) {
-            logger.warn(`패턴 RegExp 변환 실패: ${JSON.stringify(p).substring(0, 80)}... - ${e.message}`);
-            return null;
-          }
+        } else if (typeof p === 'string') {
+          return {
+            pattern: p,
+            flags: 'g',
+            description: ''
+          };
         }
+        return null;
       }).filter(p => p !== null);
     } catch (e) {
       logger.warn(`패턴 배열 JSON 파싱 실패: ${e.message}`);
@@ -926,24 +906,40 @@ export class QdrantClient {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Singleton
+// 인스턴스 관리 (컬렉션별 분리)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * 싱글톤 인스턴스 반환
+ * 컬렉션별 인스턴스 반환
+ * 
+ * [Fix #4] 기존 단일 싱글톤 → 컬렉션명 기반 Map 관리
+ *   기존: customConfig 전달 시 기존 인스턴스를 덮어씀
+ *     → 이슈 컬렉션 초기화가 가이드라인 싱글톤을 오염시킴
+ *   수정: 컬렉션명을 키로 사용하여 각각 독립 인스턴스 관리
+ * 
+ * @param {Object|null} customConfig - 커스텀 설정 (다른 컬렉션 접근 시)
+ * @returns {QdrantClient}
  */
 export function getQdrantClient(customConfig = null) {
-  if (!instance || customConfig) {
-    instance = new QdrantClient(customConfig);
+  const cfg = customConfig || config.qdrant;
+  const key = cfg.collectionName || 'default';
+
+  if (!instances.has(key)) {
+    instances.set(key, new QdrantClient(customConfig));
   }
-  return instance;
+  return instances.get(key);
 }
 
 /**
- * 싱글톤 리셋 (테스트용)
+ * 인스턴스 리셋
+ * @param {string|null} collectionName - 특정 컬렉션만 리셋 (null이면 전체)
  */
-export function resetQdrantClient() {
-  instance = null;
+export function resetQdrantClient(collectionName = null) {
+  if (collectionName) {
+    instances.delete(collectionName);
+  } else {
+    instances.clear();
+  }
 }
 
 export default QdrantClient;

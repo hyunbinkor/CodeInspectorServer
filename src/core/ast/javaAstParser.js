@@ -6,6 +6,12 @@
  * - AST 시그니처 생성 (structural, semantic, behavioral)
  * - 리소스 누수, 보안 취약점, 성능 이슈 탐지
  * 
+ * 변경사항:
+ * - [Fix #3] fallbackAnalysis()에 codeTagger가 기대하는 필드 추가
+ *   resourceUsage, exceptionHandling(객체), loopInfo, methodCount
+ *   기존 필드(resourceLifecycles, exceptionHandling 배열 등)는 하위 호환을 위해 유지
+ * - [Fix #3] createEmptyAnalysis()의 구조도 동일하게 정합
+ * 
  * @module ast/javaAstParser
  */
 
@@ -84,7 +90,11 @@ export class JavaASTParser {
   }
 
   /**
-   * 빈 분석 결과 생성 (기존 로직)
+   * 빈 분석 결과 생성
+   * 
+   * [Fix #3] codeTagger가 기대하는 구조와 일치하도록 수정
+   *   - exceptionHandling: 배열 → 객체 (tryCatchCount, hasEmptyCatch 등)
+   *   - resourceUsage, loopInfo, methodCount 추가
    */
   createEmptyAnalysis() {
     return {
@@ -92,6 +102,7 @@ export class JavaASTParser {
       nodeCount: 0,
       maxDepth: 1,
       cyclomaticComplexity: 1,
+      methodCount: 0,
       
       classDeclarations: [],
       methodDeclarations: [],
@@ -99,16 +110,38 @@ export class JavaASTParser {
       methodInvocations: [],
       constructorCalls: [],
       controlStructures: [],
-      exceptionHandling: [],
       annotations: [],
       inheritancePatterns: [],
       
+      // [Fix #3] codeTagger 호환 필드
+      resourceUsage: [],
+      exceptionHandling: {
+        tryCatchCount: 0,
+        hasEmptyCatch: false,
+        hasGenericCatch: false,
+        hasTryWithResources: false,
+        hasCloseInFinally: false
+      },
+      securityPatterns: [],
+      loopInfo: {
+        forCount: 0,
+        whileCount: 0,
+        doWhileCount: 0,
+        hasDbCallInLoop: false,
+        hasNestedLoop: false
+      },
+
+      // 기존 상세 분석 필드 (하위 호환)
+      exceptionHandlingIssues: [],
       resourceLifecycles: [],
       resourceLeakRisks: [],
-      securityPatterns: [],
+      securityIssues: [],
       sqlInjectionRisks: [],
       performanceIssues: [],
-      loopAnalysis: [],
+      loopAnalysis: {
+        forCount: 0, whileCount: 0, doWhileCount: 0,
+        hasDbCallInLoop: false, hasNestedLoop: false
+      },
       codeSmells: [],
       designPatterns: []
     };
@@ -119,35 +152,68 @@ export class JavaASTParser {
   // ═══════════════════════════════════════════════════════════════════════════════
 
   /**
-   * 정규식 기반 폴백 분석 (기존 fallbackAnalysis 로직)
+   * 정규식 기반 폴백 분석
+   * 
+   * [Fix #3] codeTagger 호환 필드 추가
+   *   기존 상세 분석 결과에서 codeTagger가 기대하는 간소화 필드를 파생
    */
   fallbackAnalysis(javaCode) {
+    // 기존 분석 실행
+    const resourceLifecycles = this.analyzeResourcesRegex(javaCode);
+    const exceptionHandlingIssues = this.analyzeExceptionHandlingRegex(javaCode);
+    const securityIssues = this.analyzeSecurityRegex(javaCode);
+    const loopAnalysis = this.analyzeLoopsRegex(javaCode);
+    const methodDeclarations = this.extractMethodsRegex(javaCode);
+
+    // [Fix #3] codeTagger 호환 필드 파생
+    const resourceUsage = [...new Set(resourceLifecycles.map(r => r.type))];
+
+    const tryCatchCount = (javaCode.match(/\bcatch\s*\(/g) || []).length;
+    const hasTryWithResources = /try\s*\([^)]+\)\s*\{/.test(javaCode);
+    const hasCloseInFinally = /finally\s*\{[^}]*\.close\s*\(/.test(javaCode);
+
+    const exceptionHandling = {
+      tryCatchCount,
+      hasEmptyCatch: exceptionHandlingIssues.some(i => i.type === 'EMPTY_CATCH'),
+      hasGenericCatch: exceptionHandlingIssues.some(i => i.type === 'GENERIC_CATCH'),
+      hasTryWithResources,
+      hasCloseInFinally
+    };
+
+    const securityPatterns = securityIssues.map(i => i.type);
+
     return {
       // 기본 구조 분석
       nodeTypes: this.extractNodeTypesRegex(javaCode),
       nodeCount: this.countNodesRegex(javaCode),
       maxDepth: this.estimateDepthRegex(javaCode),
       cyclomaticComplexity: this.calculateComplexityRegex(javaCode),
+      methodCount: methodDeclarations.length,
 
       // 선언 추출
       classDeclarations: this.extractClassesRegex(javaCode),
-      methodDeclarations: this.extractMethodsRegex(javaCode),
+      methodDeclarations,
       variableDeclarations: this.extractVariablesRegex(javaCode),
       methodInvocations: this.extractMethodCallsRegex(javaCode),
       annotations: this.extractAnnotationsRegex(javaCode),
 
-      // 빈 배열 (AST 기반 분석 시에만 채워짐)
       controlStructures: [],
-      exceptionHandling: this.analyzeExceptionHandlingRegex(javaCode),
       inheritancePatterns: [],
 
-      // 이슈 분석
-      resourceLifecycles: this.analyzeResourcesRegex(javaCode),
+      // [Fix #3] codeTagger 호환 필드 (간소화)
+      resourceUsage,
+      exceptionHandling,
+      securityPatterns,
+      loopInfo: loopAnalysis,
+
+      // 기존 상세 분석 필드 (하위 호환 — 시그니처 생성 등에서 사용)
+      exceptionHandlingIssues,
+      resourceLifecycles,
       resourceLeakRisks: [],
-      securityPatterns: this.analyzeSecurityRegex(javaCode),
+      securityIssues,
       sqlInjectionRisks: [],
       performanceIssues: this.analyzePerformanceRegex(javaCode),
-      loopAnalysis: this.analyzeLoopsRegex(javaCode),
+      loopAnalysis,
       codeSmells: [],
       designPatterns: []
     };
@@ -157,9 +223,6 @@ export class JavaASTParser {
   // 노드 타입 추출 (기존 로직)
   // ═══════════════════════════════════════════════════════════════════════════════
 
-  /**
-   * 정규식으로 주요 구문 타입 추출 (기존 extractNodeTypesRegex)
-   */
   extractNodeTypesRegex(code) {
     const patterns = {
       'ClassDeclaration': /class\s+\w+/g,
@@ -185,16 +248,10 @@ export class JavaASTParser {
     return nodeTypes;
   }
 
-  /**
-   * 정규식으로 추출한 노드 타입의 총 개수 (기존 countNodesRegex)
-   */
   countNodesRegex(code) {
     return this.extractNodeTypesRegex(code).length;
   }
 
-  /**
-   * 중괄호 쌍으로 코드 블록의 최대 중첩 깊이 계산 (기존 estimateDepthRegex)
-   */
   estimateDepthRegex(code) {
     let maxDepth = 0;
     let currentDepth = 0;
@@ -211,9 +268,6 @@ export class JavaASTParser {
     return maxDepth;
   }
 
-  /**
-   * if, for, while 등 분기 구문 개수로 순환 복잡도 추정 (기존 calculateComplexityRegex)
-   */
   calculateComplexityRegex(code) {
     const complexityPatterns = /if|for|while|switch|case|catch|\?\s*:/g;
     const matches = code.match(complexityPatterns) || [];
@@ -221,12 +275,9 @@ export class JavaASTParser {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  // 선언 추출 (기존 로직 - 더 상세한 버전)
+  // 선언 추출 (기존 로직)
   // ═══════════════════════════════════════════════════════════════════════════════
 
-  /**
-   * 클래스 선언문에서 이름, 상속, 구현 인터페이스 추출 (기존 extractClassesRegex)
-   */
   extractClassesRegex(code) {
     const classPattern = /(?:public\s+)?(?:abstract\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?(?:\s+implements\s+([\w,\s]+))?/g;
     const classes = [];
@@ -243,16 +294,12 @@ export class JavaASTParser {
     return classes;
   }
 
-  /**
-   * 메서드 선언문에서 반환 타입, 이름, 매개변수 추출 (기존 extractMethodsRegex)
-   */
   extractMethodsRegex(code) {
     const methodPattern = /(?:public|private|protected)?\s*(?:static)?\s*(\w+)\s+(\w+)\s*\(([^)]*)\)/g;
     const methods = [];
     let match;
 
     while ((match = methodPattern.exec(code)) !== null) {
-      // 'class', 'if', 'for' 등의 키워드 제외
       const excludeKeywords = ['class', 'interface', 'if', 'for', 'while', 'switch', 'catch', 'new'];
       if (!excludeKeywords.includes(match[2])) {
         methods.push({
@@ -266,15 +313,11 @@ export class JavaASTParser {
     return methods;
   }
 
-  /**
-   * 변수 선언문에서 타입, 이름, 초기화 여부 추출 (기존 extractVariablesRegex)
-   */
   extractVariablesRegex(code) {
     const varPattern = /(?:private|public|protected|final)?\s*(\w+)\s+(\w+)\s*(?:=([^;]+))?;/g;
     const variables = [];
     let match;
 
-    // 키워드 제외 목록
     const excludeTypes = ['class', 'interface', 'return', 'throw', 'new', 'if', 'for', 'while'];
 
     while ((match = varPattern.exec(code)) !== null) {
@@ -290,9 +333,6 @@ export class JavaASTParser {
     return variables;
   }
 
-  /**
-   * "객체.메서드(" 패턴으로 메서드 호출 추출 (기존 extractMethodCallsRegex)
-   */
   extractMethodCallsRegex(code) {
     const callPattern = /(\w+)\.(\w+)\s*\(/g;
     const calls = [];
@@ -308,9 +348,6 @@ export class JavaASTParser {
     return calls;
   }
 
-  /**
-   * @어노테이션 패턴으로 어노테이션 추출 (기존 extractAnnotationsRegex)
-   */
   extractAnnotationsRegex(code) {
     const annotationPattern = /@(\w+)(?:\([^)]*\))?/g;
     const annotations = [];
@@ -326,12 +363,9 @@ export class JavaASTParser {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  // 리소스/보안/성능 분석 (기존 로직 - 더 상세한 버전)
+  // 리소스/보안/성능 분석 (기존 로직)
   // ═══════════════════════════════════════════════════════════════════════════════
 
-  /**
-   * Connection, FileStream 등 리소스의 생성/해제 패턴 분석 (기존 analyzeResourcesRegex)
-   */
   analyzeResourcesRegex(code) {
     const resources = [];
 
@@ -342,11 +376,9 @@ export class JavaASTParser {
       while ((match = pattern.exec(code)) !== null) {
         const varName = match[1];
 
-        // try-with-resources 구문 내에 있는지 확인
         const tryWithResourcesPattern = new RegExp(`try\\s*\\([^)]*${varName}[^)]*\\)`, 'g');
         const inTryWithResources = tryWithResourcesPattern.test(code);
 
-        // 명시적 close() 호출이 있는지 확인
         const closePattern = new RegExp(`${varName}\\.close\\(\\)`, 'g');
         const hasCloseCall = closePattern.test(code);
 
@@ -363,25 +395,20 @@ export class JavaASTParser {
     return resources;
   }
 
-  /**
-   * SQL 인젝션, XSS 등 보안 취약점 패턴 탐지 (기존 analyzeSecurityRegex)
-   */
   analyzeSecurityRegex(code) {
     const securityIssues = [];
 
-    // SQL 쿼리에서 문자열 연결(+) 사용 시 SQL 인젝션 위험
     if (code.includes('executeQuery') || code.includes('executeUpdate')) {
       const sqlConcatPattern = /["'].*\+.*["']/g;
       if (sqlConcatPattern.test(code)) {
         securityIssues.push({
-          type: 'SQL_INJECTION',
+          type: 'SQL_CONCATENATION',
           description: 'String concatenation in SQL query',
           severity: 'HIGH'
         });
       }
     }
 
-    // 사용자 입력을 인코딩 없이 직접 출력 시 XSS 위험
     if (code.includes('getWriter') && code.includes('println')) {
       securityIssues.push({
         type: 'XSS',
@@ -390,7 +417,6 @@ export class JavaASTParser {
       });
     }
 
-    // 하드코딩된 비밀번호
     if (/(?:password|passwd|pwd)\s*=\s*["'][^"']+["']/i.test(code)) {
       securityIssues.push({
         type: 'HARDCODED_PASSWORD',
@@ -402,13 +428,9 @@ export class JavaASTParser {
     return securityIssues;
   }
 
-  /**
-   * 루프 내 데이터베이스 쿼리 등 성능 문제 패턴 탐지 (기존 analyzePerformanceRegex)
-   */
   analyzePerformanceRegex(code) {
     const performanceIssues = [];
 
-    // 반복문 안에서 데이터베이스 쿼리 실행 시 N+1 문제 발생
     const loopWithQueryPattern = /(for|while)\s*\([^)]*\)\s*\{[^}]*(?:executeQuery|find|get)[^}]*\}/g;
     if (loopWithQueryPattern.test(code)) {
       performanceIssues.push({
@@ -418,7 +440,6 @@ export class JavaASTParser {
       });
     }
 
-    // 루프 내 객체 생성
     const loopWithNewPattern = /(for|while)\s*\([^)]*\)\s*\{[^}]*new\s+\w+[^}]*\}/g;
     if (loopWithNewPattern.test(code)) {
       performanceIssues.push({
@@ -431,13 +452,9 @@ export class JavaASTParser {
     return performanceIssues;
   }
 
-  /**
-   * 예외 처리 분석
-   */
   analyzeExceptionHandlingRegex(code) {
     const issues = [];
 
-    // 빈 catch 블록
     if (/catch\s*\([^)]+\)\s*\{\s*\}/s.test(code)) {
       issues.push({
         type: 'EMPTY_CATCH',
@@ -446,7 +463,6 @@ export class JavaASTParser {
       });
     }
 
-    // 포괄적 예외 처리
     if (/catch\s*\(\s*Exception\s+\w+\s*\)/.test(code)) {
       issues.push({
         type: 'GENERIC_CATCH',
@@ -455,7 +471,6 @@ export class JavaASTParser {
       });
     }
 
-    // printStackTrace() 사용
     if (/\.printStackTrace\s*\(\s*\)/.test(code)) {
       issues.push({
         type: 'PRINT_STACK_TRACE',
@@ -467,9 +482,6 @@ export class JavaASTParser {
     return issues;
   }
 
-  /**
-   * 루프 분석
-   */
   analyzeLoopsRegex(code) {
     const loopInfo = {
       forCount: (code.match(/\bfor\s*\(/g) || []).length,
@@ -479,18 +491,12 @@ export class JavaASTParser {
       hasNestedLoop: false
     };
 
-    // 루프 내 DB 호출 감지
     loopInfo.hasDbCallInLoop = this.detectDbCallInLoop(code);
-
-    // 중첩 루프 감지
     loopInfo.hasNestedLoop = this.detectNestedLoop(code);
 
     return loopInfo;
   }
 
-  /**
-   * 루프 내 DB 호출 감지
-   */
   detectDbCallInLoop(code) {
     const loopPattern = /(?:for|while)\s*\([^)]*\)\s*\{/g;
     let match;
@@ -517,9 +523,6 @@ export class JavaASTParser {
     return false;
   }
 
-  /**
-   * 중첩 루프 감지
-   */
   detectNestedLoop(code) {
     const outerLoopPattern = /(?:for|while)\s*\([^)]*\)\s*\{/g;
     let match;
@@ -536,9 +539,6 @@ export class JavaASTParser {
     return false;
   }
 
-  /**
-   * 중괄호 블록 추출
-   */
   extractBlock(code, startIndex) {
     let braceCount = 1;
     let endIndex = startIndex;
@@ -553,57 +553,64 @@ export class JavaASTParser {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  // AST 시그니처 생성 (기존 generateASTSignature 로직 - 핵심!)
+  // AST 시그니처 생성 (기존 로직)
   // ═══════════════════════════════════════════════════════════════════════════════
 
-  /**
-   * AST 구조를 3가지 관점의 시그니처로 변환 (기존 generateASTSignature)
-   * 코드 검색/비교용
-   * 
-   * @param {Object} astAnalysis - 분석 결과
-   * @returns {Object} { structural, semantic, behavioral }
-   */
-  generateASTSignature(astAnalysis) {
-    const signature = {
-      // 구조적 시그니처: 노드 구성, 깊이, 복잡도
-      structural: {
-        nodePattern: this.generateNodePattern(astAnalysis.nodeTypes),
-        depthPattern: astAnalysis.maxDepth,
-        complexityPattern: astAnalysis.cyclomaticComplexity
-      },
+  generateASTSignature(analysis) {
+    const structural = this.generateStructuralSignature(analysis);
+    const semantic = this.generateSemanticSignature(analysis);
+    const behavioral = this.generateBehavioralSignature(analysis);
 
-      // 의미론적 시그니처: 리소스 사용, 보안 패턴, 프레임워크 활용
-      semantic: {
-        resourcePattern: this.generateResourcePattern(astAnalysis.resourceLifecycles),
-        securityPattern: this.generateSecurityPattern(astAnalysis.securityPatterns),
-        frameworkPattern: this.generateFrameworkPattern(
-          astAnalysis.annotations,
-          astAnalysis.classDeclarations
-        )
-      },
-
-      // 행동 패턴 시그니처: 메서드 호출 순서, 제어 흐름, 예외 처리
-      behavioral: {
-        methodCallPattern: this.generateMethodCallPattern(astAnalysis.methodInvocations),
-        controlFlowPattern: this.generateControlFlowPattern(astAnalysis.controlStructures),
-        exceptionPattern: this.generateExceptionPattern(astAnalysis.exceptionHandling)
-      }
+    return {
+      structural,
+      semantic,
+      behavioral,
+      combined: `${structural}|${semantic}|${behavioral}`
     };
-
-    return signature;
   }
 
-  /**
-   * 상위 10개 노드를 화살표로 연결한 패턴 문자열 생성 (기존 generateNodePattern)
-   */
-  generateNodePattern(nodeTypes) {
-    if (!nodeTypes || !Array.isArray(nodeTypes)) return '';
-    return nodeTypes.slice(0, 10).join('->');
+  generateStructuralSignature(analysis) {
+    const parts = [
+      `depth:${analysis.maxDepth || 0}`,
+      `complexity:${analysis.cyclomaticComplexity || 0}`,
+      `methods:${(analysis.methodDeclarations || []).length}`,
+      `classes:${(analysis.classDeclarations || []).length}`
+    ];
+    return parts.join(',');
   }
 
-  /**
-   * "리소스타입:생명주기단계" 형식의 패턴 문자열 생성 (기존 generateResourcePattern)
-   */
+  generateSemanticSignature(analysis) {
+    const parts = [];
+
+    const annotations = (analysis.annotations || []).map(a => `@${a.name || a}`).join(',');
+    if (annotations) parts.push(`ann:${annotations}`);
+
+    const resources = this.generateResourcePattern(analysis.resourceLifecycles || []);
+    if (resources) parts.push(`res:${resources}`);
+
+    // [Fix #3] exceptionHandlingIssues 사용 (기존 배열 필드)
+    const exceptions = this.generateExceptionPattern(analysis.exceptionHandlingIssues || []);
+    if (exceptions) parts.push(`exc:${exceptions}`);
+
+    return parts.join('|') || 'none';
+  }
+
+  generateBehavioralSignature(analysis) {
+    const parts = [];
+
+    const methodCalls = this.generateMethodCallPattern(analysis.methodInvocations || []);
+    if (methodCalls) parts.push(`calls:${methodCalls}`);
+
+    const controlFlow = this.generateControlFlowPattern(analysis.controlStructures || []);
+    if (controlFlow) parts.push(`flow:${controlFlow}`);
+
+    // [Fix #3] securityIssues 사용 (기존 배열 필드)
+    const security = this.generateSecurityPattern(analysis.securityIssues || []);
+    if (security) parts.push(`sec:${security}`);
+
+    return parts.join('|') || 'none';
+  }
+
   generateResourcePattern(resourceLifecycles) {
     if (!resourceLifecycles || !Array.isArray(resourceLifecycles)) return '';
     return resourceLifecycles.map(r => {
@@ -612,17 +619,11 @@ export class JavaASTParser {
     }).join(',');
   }
 
-  /**
-   * 보안 패턴 타입들을 쉼표로 연결한 문자열 생성 (기존 generateSecurityPattern)
-   */
   generateSecurityPattern(securityPatterns) {
     if (!securityPatterns || !Array.isArray(securityPatterns)) return '';
     return securityPatterns.map(p => p.type || p).join(',');
   }
 
-  /**
-   * 어노테이션과 상속 관계를 결합한 패턴 생성 (기존 generateFrameworkPattern)
-   */
   generateFrameworkPattern(annotations, classDeclarations) {
     const patterns = [];
 
@@ -644,9 +645,6 @@ export class JavaASTParser {
     return patterns.join(',');
   }
 
-  /**
-   * 상위 5개 메서드 호출을 "객체.메서드" 형식으로 연결 (기존 generateMethodCallPattern)
-   */
   generateMethodCallPattern(methodInvocations) {
     if (!methodInvocations || !Array.isArray(methodInvocations)) return '';
     return methodInvocations
@@ -655,17 +653,11 @@ export class JavaASTParser {
       .join('->');
   }
 
-  /**
-   * 제어 구조 타입들을 순서대로 화살표로 연결 (기존 generateControlFlowPattern)
-   */
   generateControlFlowPattern(controlStructures) {
     if (!controlStructures || !Array.isArray(controlStructures)) return '';
     return controlStructures.map(cs => cs.type || cs).join('->');
   }
 
-  /**
-   * 예외 처리 타입들을 쉼표로 연결한 문자열 생성 (기존 generateExceptionPattern)
-   */
   generateExceptionPattern(exceptionHandling) {
     if (!exceptionHandling || !Array.isArray(exceptionHandling)) return '';
     return exceptionHandling.map(eh => eh.type || eh).join(',');
@@ -678,9 +670,6 @@ export class JavaASTParser {
 
 let instance = null;
 
-/**
- * 싱글톤 인스턴스 반환
- */
 export function getJavaAstParser() {
   if (!instance) {
     instance = new JavaASTParser();
@@ -688,9 +677,6 @@ export function getJavaAstParser() {
   return instance;
 }
 
-/**
- * 싱글톤 리셋 (테스트용)
- */
 export function resetJavaAstParser() {
   instance = null;
 }

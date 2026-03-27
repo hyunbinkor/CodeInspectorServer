@@ -18,6 +18,8 @@
  * - [Fix #2] matchesContextualCondition: 조건 없는 규칙 통과
  * - [Fix #3] llm_with_regex antiPatterns 없을 때 llm_contextual 폴백
  * - [Fix #4] limit 200 → 10000
+ * - [Fix #10] filteringStats를 checkCode 진입 시 리셋 (요청별 스코프)
+ * - [Fix #11] scoreThreshold 파라미터 제거 (scroll API에서 무의미)
  *
  * @module checker/codeChecker
  */
@@ -32,7 +34,8 @@ import { MethodChunker }    from '../chunker/methodChunker.js';
 import { ChunkResultMerger } from '../chunker/chunkResultMerger.js';
 import { getQdrantRuleRepository } from '../../repositories/impl/QdrantRuleRepository.js';  // [Fix #1] Repository 추가
 import { listFiles, readTextFile, writeJsonFile } from '../../utils/fileUtils.js';
-import { addLineNumbers }   from '../../utils/codeUtils.js';   // ← [Fix] 추가
+import { addLineNumbers }   from '../../utils/codeUtils.js';
+import { createRegexSafe }  from '../../utils/regexUtils.js';
 import { config }           from '../../config/index.js';
 import logger               from '../../utils/loggerUtils.js';
 
@@ -160,6 +163,9 @@ export class CodeChecker {
     const onProgress = options.onProgress || (() => {});
     const lineCount  = code.split('\n').length;
 
+    // [Fix #10] 검사 요청별 통계 리셋 — 이전 검사의 누적값이 남지 않도록
+    this.resetFilteringStats();
+
     const needsChunking = options.forceChunk || this.methodChunker.needsChunking(code);
 
     onProgress({ stage: 'start', fileName, lineCount, chunked: needsChunking, timestamp: Date.now() });
@@ -184,8 +190,8 @@ export class CodeChecker {
 
     logger.debug(`[${fileName}] 룰 조회...`);
     // [Fix #1] Repository 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
-    // [Fix #4] limit 200 → 10000
-    const matchedRules = await this.ruleRepository.findByTags(tags, { limit: 10000, scoreThreshold: 0.3 });
+    // [Fix #11] scoreThreshold 제거 — scroll API는 벡터 유사도 검색이 아닌 필터 기반 전수 조회이므로 무의미
+    const matchedRules = await this.ruleRepository.findByTags(tags, { limit: 10000 });
     logger.info(`[${fileName}] 매칭 룰: ${matchedRules.length}개`);
 
     onProgress({ stage: 'rules', status: 'done', matchedRules: matchedRules.length, elapsed: Date.now() - startTime });
@@ -361,10 +367,9 @@ export class CodeChecker {
 
     // Step 3: 태그 기반 룰 조회
     // [Fix #1] Repository 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
-    // [Fix #4] limit 200 → 10000
+    // [Fix #11] scoreThreshold 제거 — scroll API는 필터 기반 전수 조회
     const matchedRules = await this.ruleRepository.findByTags(tags, {
-      limit:          10000,
-      scoreThreshold: 0.3
+      limit: 10000
     });
 
     if (matchedRules.length === 0) {
@@ -470,35 +475,30 @@ export class CodeChecker {
 
     if (rule.antiPatterns && rule.antiPatterns.length > 0) {
       for (const antiPattern of rule.antiPatterns) {
-        try {
-          const regex = antiPattern.regex instanceof RegExp
-            ? antiPattern.regex
-            : new RegExp(antiPattern.pattern || antiPattern, antiPattern.flags || 'g');
+        const regex = this._compilePattern(antiPattern, rule.ruleId);
+        if (!regex) continue;
 
-          regex.lastIndex = 0;
-          let match;
+        regex.lastIndex = 0;
+        let match;
 
-          while ((match = regex.exec(sourceCode)) !== null) {
-            const beforeMatch = sourceCode.substring(0, match.index);
-            const lineNumber  = (beforeMatch.match(/\n/g) || []).length + 1;
-            const lineContent = lines[lineNumber - 1] || '';
+        while ((match = regex.exec(sourceCode)) !== null) {
+          const beforeMatch = sourceCode.substring(0, match.index);
+          const lineNumber  = (beforeMatch.match(/\n/g) || []).length + 1;
+          const lineContent = lines[lineNumber - 1] || '';
 
-            if (this.matchesGoodPattern(lineContent, rule.goodPatterns)) continue;
+          if (this.matchesGoodPattern(lineContent, rule.goodPatterns, rule.ruleId)) continue;
 
-            violations.push({
-              ruleId:      rule.ruleId,
-              title:       rule.title || '',
-              line:        lineNumber,
-              severity:    rule.severity || 'MEDIUM',
-              description: antiPattern.description || rule.description || '',
-              suggestion:  rule.suggestion || '',
-              category:    rule.category || 'general',
-              checkType:   'pure_regex',
-              source:      'code_checker_regex'
-            });
-          }
-        } catch (error) {
-          logger.warn(`pure_regex 오류 [${rule.ruleId}]: ${error.message}`);
+          violations.push({
+            ruleId:      rule.ruleId,
+            title:       rule.title || '',
+            line:        lineNumber,
+            severity:    rule.severity || 'MEDIUM',
+            description: antiPattern.description || rule.description || '',
+            suggestion:  rule.suggestion || '',
+            category:    rule.category || 'general',
+            checkType:   'pure_regex',
+            source:      'code_checker_regex'
+          });
         }
       }
     }
@@ -506,15 +506,13 @@ export class CodeChecker {
     return { violations };
   }
 
-  matchesGoodPattern(lineContent, goodPatterns) {
+  matchesGoodPattern(lineContent, goodPatterns, ruleId = '') {
     if (!goodPatterns || goodPatterns.length === 0) return false;
     for (const gp of goodPatterns) {
-      try {
-        const regex = gp.regex instanceof RegExp
-          ? gp.regex
-          : new RegExp(gp.pattern || gp, gp.flags || 'g');
-        if (regex.test(lineContent)) return true;
-      } catch {}
+      const regex = this._compilePattern(gp, ruleId);
+      if (!regex) continue;
+      regex.lastIndex = 0;
+      if (regex.test(lineContent)) return true;
     }
     return false;
   }
@@ -526,36 +524,100 @@ export class CodeChecker {
     if (!rule.antiPatterns || rule.antiPatterns.length === 0) return candidates;
 
     for (const antiPattern of rule.antiPatterns) {
-      try {
-        const regex = antiPattern.regex instanceof RegExp
-          ? antiPattern.regex
-          : new RegExp(antiPattern.pattern || antiPattern, antiPattern.flags || 'g');
+      const regex = this._compilePattern(antiPattern, rule.ruleId);
+      if (!regex) continue;
 
-        regex.lastIndex = 0;
-        let match;
+      regex.lastIndex = 0;
+      let match;
 
-        while ((match = regex.exec(sourceCode)) !== null) {
-          const beforeMatch = sourceCode.substring(0, match.index);
-          const lineNumber  = (beforeMatch.match(/\n/g) || []).length + 1;
-          const lineContent = lines[lineNumber - 1] || '';
+      while ((match = regex.exec(sourceCode)) !== null) {
+        const beforeMatch = sourceCode.substring(0, match.index);
+        const lineNumber  = (beforeMatch.match(/\n/g) || []).length + 1;
+        const lineContent = lines[lineNumber - 1] || '';
 
-          if (this.matchesGoodPattern(lineContent, rule.goodPatterns)) continue;
+        if (this.matchesGoodPattern(lineContent, rule.goodPatterns, rule.ruleId)) continue;
 
-          candidates.push({
-            line:               lineNumber,
-            content:            lineContent.trim(),
-            matchedText:        match[0],
-            patternDescription: antiPattern.description || ''
-          });
+        candidates.push({
+          line:               lineNumber,
+          content:            lineContent.trim(),
+          matchedText:        match[0],
+          patternDescription: antiPattern.description || ''
+        });
 
-          if (candidates.length >= 10) break;
-        }
-      } catch (error) {
-        logger.warn(`후보 탐지 오류 [${rule.ruleId}]: ${error.message}`);
+        if (candidates.length >= 10) break;
       }
     }
 
     return candidates;
+  }
+
+  /**
+   * 패턴 객체 {pattern, flags, description}를 RegExp로 컴파일
+   * 
+   * - 저장/조회 시에는 {pattern, flags, description} 문자열 그대로 유지
+   * - Code Check 시점에만 이 메서드로 RegExp 생성
+   * - PCRE 잔존 패턴 자동 변환 (저장 시 변환 누락 엣지 케이스 방어)
+   * 
+   * @param {Object} patternObj - { pattern: string, flags: string, description: string }
+   * @param {string} ruleId - 로깅용 규칙 ID
+   * @returns {RegExp|null} 컴파일된 정규식 또는 null (실패 시)
+   * @private
+   */
+  _compilePattern(patternObj, ruleId = '') {
+    if (!patternObj || !patternObj.pattern) return null;
+
+    try {
+      const converted = this._convertPCREtoJS(patternObj.pattern, patternObj.flags || 'g');
+      return new RegExp(converted.pattern, converted.flags);
+    } catch (error) {
+      logger.warn(`[${ruleId}] 패턴 컴파일 실패: ${patternObj.pattern} — ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * PCRE 정규식을 JavaScript RegExp로 변환
+   * codeTagger._convertPCREtoJS와 동일 로직
+   * @private
+   */
+  _convertPCREtoJS(pattern, flags) {
+    let newPattern = pattern;
+    const flagSet = new Set(flags.split(''));
+
+    // 선두 인라인 플래그: (?imsx)
+    const leadingMatch = newPattern.match(/^\(\?([imsx]+)\)/);
+    if (leadingMatch) {
+      const inlineFlags = leadingMatch[1];
+      newPattern = newPattern.replace(/^\(\?[imsx]+\)/, '');
+      if (inlineFlags.includes('i')) flagSet.add('i');
+      if (inlineFlags.includes('m')) flagSet.add('m');
+      if (inlineFlags.includes('s')) flagSet.add('s');
+    }
+
+    // 중간 인라인 플래그: (?i:...) → (?:...)
+    newPattern = newPattern.replace(/\(\?([imsx]+):/g, (_, inlineFlags) => {
+      if (inlineFlags.includes('i')) flagSet.add('i');
+      if (inlineFlags.includes('m')) flagSet.add('m');
+      if (inlineFlags.includes('s')) flagSet.add('s');
+      return '(?:';
+    });
+    newPattern = newPattern.replace(/\(\?[imsx]+\)/g, '');
+
+    // Atomic groups (?>...) → (?:...)
+    newPattern = newPattern.replace(/\(\?>/g, '(?:');
+
+    // Possessive quantifiers
+    newPattern = newPattern.replace(/\+\+/g, '+');
+    newPattern = newPattern.replace(/\*\+/g, '*');
+    newPattern = newPattern.replace(/\?\+/g, '?');
+
+    // Named groups (?P<n>...) → (?<n>...)
+    newPattern = newPattern.replace(/\(\?P</g, '(?<');
+
+    // Named backreference (?P=name) → \k<n>
+    newPattern = newPattern.replace(/\(\?P=(\w+)\)/g, '\\k<$1>');
+
+    return { pattern: newPattern, flags: Array.from(flagSet).join('') };
   }
 
   matchesContextualCondition(sourceCode, rule, tagSet) {

@@ -8,23 +8,63 @@
  * - Diff: 변경사항 미리보기
  * - Push: 전체 데이터 업로드 (자동 백업)
  *
- * ─── 버그 수정 (2곳) ───────────────────────────────────────────────────────
+ * ─── 버그 수정 ─────────────────────────────────────────────────────────────
  * [Fix 1] getCurrentVersion()이 항상 Date.now()를 반환하여 무조건 충돌 발생
  *   → version.json 파일에 버전을 영속 저장하도록 변경
- *   → loadVersion() / saveVersion() 메서드 추가
- *   → pull()  : 저장된 버전 반환 (최초 실행 시에만 Date.now()로 초기화)
- *   → push()  : 성공 후 saveVersion(newVersion) 호출
- *   → getCurrentVersion() : Date.now() 대신 저장된 버전 반환
+ *
+ * [Fix 2] isRuleModified / getRuleChanges의 compareFields에
+ *   antiPatterns, goodPatterns, problematicCode, fixedCode 등 누락
+ *   → 전체 필드 추가 + RegExp 객체 정규화 처리
+ *
+ * [Fix D] Push 성공 후 tagDefinitionLoader / codeTagger 싱글톤 리셋
+ *   → JSON 파일 갱신 후 메모리의 compiledPatterns가 갱신되지 않던 문제 해결
+ *   → 다음 검사 요청 시 새 패턴으로 자동 재초기화
+ *
+ * [Fix #1] Push 후 ruleRepository / codeChecker 싱글톤도 리셋
+ *   → 규칙 변경 시 기존 캐시된 참조가 남아 있던 문제 해결
+ *
+ * [Fix #5] Push 후 checkService 싱글톤 리셋
+ *   → checkService가 이전 codeChecker 참조를 유지하던 문제 해결
+ *
+ * [Qdrant 이전] 태그 저장소를 JsonTagRepository(/tmp) → QdrantTagRepository로 교체
+ *   → 서버 재시작 시에도 태그 데이터 유지
+ *
+ * [Fix #8] 버전 관리를 /tmp/version.json → Qdrant 태그 메타데이터로 이전
+ *   → 서버 재시작 시에도 버전 정보 유지
+ *
+ * [Fix #7] 백업 저장을 /tmp/backup → Qdrant 포인트로 이전
+ *   → 서버 재시작 시에도 백업 데이터 유지
  *
  * @module services/dataService
  */
 
-import fs from 'fs/promises';
-import path from 'path';
-import { getQdrantRuleRepository } from '../repositories/impl/QdrantRuleRepository.js';
-import { getJsonTagRepository } from '../repositories/impl/JsonTagRepository.js';
+import { getQdrantRuleRepository, resetQdrantRuleRepository } from '../repositories/impl/QdrantRuleRepository.js';  // [Fix #1]
+import { getQdrantTagRepository } from '../repositories/impl/QdrantTagRepository.js';   // [Qdrant 이전] JSON → Qdrant
+import { resetTagDefinitionLoader } from '../core/tagger/tagDefinitionLoader.js';  // [Fix D]
+import { resetCodeTagger } from '../core/tagger/codeTagger.js';                    // [Fix D]
+import { resetCodeChecker } from '../core/checker/codeChecker.js';                 // [Fix #1]
+import { resetCheckService } from './checkService.js';                             // [Fix #5]
 import { config } from '../config/index.js';
 import logger from '../utils/loggerUtils.js';
+
+// ─── Diff 비교 대상 필드 (공유 상수) ──────────────────────────────────────────
+// [Fix 2] 기존: 9개 필드만 비교 → 패턴/코드/태그 필드 전부 누락
+//         수정: 의미 있는 모든 필드를 비교
+const RULE_COMPARE_FIELDS = [
+  // 기본 메타
+  'title', 'description', 'category', 'severity',
+  'checkType', 'tagCondition', 'message', 'suggestion', 'isActive',
+  // 패턴 (antiPatterns, goodPatterns는 RegExp 포함이라 별도 정규화 필요)
+  'antiPatterns', 'goodPatterns',
+  // 코드 예시
+  'problematicCode', 'fixedCode',
+  // 태그 필터
+  'requiredTags', 'excludeTags', 'keywords',
+  // AST 관련
+  'astHints', 'checkPoints',
+  // 예시
+  'examples',
+];
 
 export class DataService {
   constructor() {
@@ -45,7 +85,7 @@ export class DataService {
     this.ruleRepository = getQdrantRuleRepository();
     await this.ruleRepository.initialize();
 
-    this.tagRepository = getJsonTagRepository();
+    this.tagRepository = getQdrantTagRepository();   // [Qdrant 이전]
     await this.tagRepository.initialize();
 
     this.initialized = true;
@@ -53,73 +93,41 @@ export class DataService {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // [Fix 1] 버전 파일 영속화 헬퍼
-  //
-  // version.json 위치: config.paths.backup 의 부모 디렉토리
-  //   예) BACKUP_PATH=/tmp/backup  →  /tmp/version.json
-  //
-  // 이유: backup 디렉토리는 Push마다 정리될 수 있으므로 한 단계 위에 저장합니다.
+  // [Fix #8] 버전 관리 — /tmp/version.json 대신 Qdrant 메타데이터 사용
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * version.json 파일 경로
-   * @private
-   */
-  get versionFilePath() {
-    return path.join(path.dirname(config.paths.backup), 'version.json');
-  }
-
-  /**
    * 저장된 버전 읽기
-   * 파일이 없으면 0 반환 (최초 실행 상태)
    * @private
    * @returns {Promise<number>}
    */
   async loadVersion() {
     try {
-      const content = await fs.readFile(this.versionFilePath, 'utf-8');
-      const parsed  = JSON.parse(content);
-      return typeof parsed.version === 'number' ? parsed.version : 0;
-    } catch {
-      // 파일 없음(ENOENT) 또는 JSON 파싱 오류 → 초기 상태
+      return await this.tagRepository.getVersion();
+    } catch (error) {
+      logger.warn(`[DataService] 버전 조회 실패: ${error.message}`);
       return 0;
     }
   }
 
   /**
-   * 버전 파일 저장
+   * 버전 저장
    * @private
    * @param {number} version
    */
   async saveVersion(version) {
     try {
-      const dir = path.dirname(this.versionFilePath);
-      await fs.mkdir(dir, { recursive: true });
-      await fs.writeFile(
-        this.versionFilePath,
-        JSON.stringify({ version, updatedAt: new Date().toISOString() }, null, 2),
-        'utf-8',
-      );
-      logger.debug(`[DataService] 버전 파일 저장: ${version}`);
+      await this.tagRepository.setVersion(version);
+      logger.debug(`[DataService] 버전 저장: ${version}`);
     } catch (error) {
-      // 저장 실패는 치명적이지 않으므로 warn 수준으로만 기록
-      logger.warn(`[DataService] 버전 파일 저장 실패: ${error.message}`);
+      logger.warn(`[DataService] 버전 저장 실패: ${error.message}`);
     }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Pull - 전체 데이터 다운로드
+  // Pull
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * 전체 데이터 Pull
-   *
-   * [Fix 1] version 생성 방식 변경
-   *   - 수정 전: 항상 Date.now() → Pull 직후 Push해도 충돌 발생
-   *   - 수정 후: version.json에서 읽기. 파일 없으면 Date.now()로 초기화 후 저장
-   *
-   * @returns {Promise<Object>} { version, pulledAt, rules, tags, metadata }
-   */
   async pull() {
     await this.ensureInitialized();
 
@@ -128,7 +136,6 @@ export class DataService {
     const rules   = await this.ruleRepository.findAll();
     const tagData = await this.tagRepository.getAllData();
 
-    // [Fix 1] 저장된 버전 사용. 최초 실행이면 현재 시각으로 초기화하고 저장
     let version = await this.loadVersion();
     if (version === 0) {
       version = Date.now();
@@ -160,15 +167,9 @@ export class DataService {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Diff - 변경사항 미리보기
+  // Diff
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * 변경사항 비교 (Diff)
-   *
-   * @param {Object} localData - 로컬 데이터 { baseVersion, rules, tags }
-   * @returns {Promise<Object>} 변경사항 상세
-   */
   async diff(localData) {
     await this.ensureInitialized();
 
@@ -176,18 +177,15 @@ export class DataService {
 
     const { baseVersion, rules: localRules = [], tags: localTags = {} } = localData;
 
-    // 현재 서버 데이터 조회
     const serverRules   = await this.ruleRepository.findAll();
     const serverTagData = await this.tagRepository.getAllData();
 
-    // 규칙 / 태그 변경사항 계산
     const ruleChanges = this.calculateRuleChanges(localRules, serverRules);
     const tagChanges  = this.calculateTagChanges(
       localTags.tags     || {},
       serverTagData.tags || {},
     );
 
-    // [Fix 1] getCurrentVersion()이 저장된 버전을 반환하므로 정확한 충돌 감지 가능
     const currentVersion = await this.getCurrentVersion();
     const hasConflict    = !!(baseVersion && baseVersion < currentVersion);
 
@@ -245,7 +243,6 @@ export class DataService {
     const deleted   = [];
     const unchanged = [];
 
-    // 로컬에 있는 것 체크
     for (const [ruleId, localRule] of localMap) {
       const serverRule = serverMap.get(ruleId);
 
@@ -263,7 +260,6 @@ export class DataService {
       }
     }
 
-    // 서버에만 있는 것 → 삭제됨
     for (const [ruleId, serverRule] of serverMap) {
       if (!localMap.has(ruleId)) {
         deleted.push({ ruleId, rule: serverRule });
@@ -275,16 +271,16 @@ export class DataService {
 
   /**
    * 규칙 수정 여부 확인
+   * 
+   * [Fix 2] compareFields 확장 + RegExp 정규화
    * @private
    */
   isRuleModified(local, server) {
-    const compareFields = [
-      'title', 'description', 'category', 'severity',
-      'checkType', 'tagCondition', 'message', 'suggestion', 'isActive',
-    ];
+    for (const field of RULE_COMPARE_FIELDS) {
+      const localVal  = this._normalizeFieldForComparison(field, local[field]);
+      const serverVal = this._normalizeFieldForComparison(field, server[field]);
 
-    for (const field of compareFields) {
-      if (JSON.stringify(local[field]) !== JSON.stringify(server[field])) {
+      if (JSON.stringify(localVal) !== JSON.stringify(serverVal)) {
         return true;
       }
     }
@@ -293,21 +289,61 @@ export class DataService {
 
   /**
    * 규칙 변경 상세 조회
+   * 
+   * [Fix 2] compareFields 확장 + RegExp 정규화
    * @private
    */
   getRuleChanges(local, server) {
     const changes = [];
-    const compareFields = [
-      'title', 'description', 'category', 'severity',
-      'checkType', 'tagCondition', 'message', 'suggestion', 'isActive',
-    ];
 
-    for (const field of compareFields) {
-      if (JSON.stringify(local[field]) !== JSON.stringify(server[field])) {
-        changes.push({ field, local: local[field], server: server[field] });
+    for (const field of RULE_COMPARE_FIELDS) {
+      const localVal  = this._normalizeFieldForComparison(field, local[field]);
+      const serverVal = this._normalizeFieldForComparison(field, server[field]);
+
+      if (JSON.stringify(localVal) !== JSON.stringify(serverVal)) {
+        changes.push({ field, local: localVal, server: serverVal });
       }
     }
     return changes;
+  }
+
+  /**
+   * Diff 비교를 위한 필드 값 정규화
+   * 
+   * 문제: Qdrant에서 읽은 규칙의 antiPatterns/goodPatterns에는
+   * _parsePatternArray()가 변환한 RegExp 객체가 들어있음.
+   * JSON.stringify(RegExp)은 "{}"를 반환하므로 비교가 깨짐.
+   * 
+   * 해결: 패턴 필드는 { pattern, flags, description } 형태로 통일
+   * 
+   * @private
+   */
+  _normalizeFieldForComparison(field, value) {
+    if (value === undefined || value === null) return null;
+
+    // antiPatterns, goodPatterns: RegExp 객체 → 순수 JSON으로 변환
+    if (field === 'antiPatterns' || field === 'goodPatterns') {
+      if (!Array.isArray(value)) return [];
+      return value.map(p => {
+        if (p instanceof RegExp) {
+          return { pattern: p.source, flags: p.flags, description: '' };
+        }
+        if (p && p.regex instanceof RegExp) {
+          // _parsePatternArray 결과: { regex: RegExp, description: string }
+          return { pattern: p.regex.source, flags: p.regex.flags, description: p.description || '' };
+        }
+        if (p && typeof p === 'object' && p.pattern) {
+          // 이미 순수 JSON 형태: { pattern, flags, description }
+          return { pattern: p.pattern, flags: p.flags || 'g', description: p.description || '' };
+        }
+        if (typeof p === 'string') {
+          return { pattern: p, flags: 'g', description: '' };
+        }
+        return p;
+      });
+    }
+
+    return value;
   }
 
   /**
@@ -320,7 +356,6 @@ export class DataService {
     const deleted   = [];
     const unchanged = [];
 
-    // 로컬에 있는 것 체크
     for (const [tagName, localTag] of Object.entries(localTags)) {
       const serverTag = serverTags[tagName];
 
@@ -333,7 +368,6 @@ export class DataService {
       }
     }
 
-    // 서버에만 있는 것 → 삭제됨
     for (const [tagName, serverTag] of Object.entries(serverTags)) {
       if (!(tagName in localTags)) {
         deleted.push({ name: tagName, tag: serverTag });
@@ -344,19 +378,9 @@ export class DataService {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // Push - 전체 데이터 업로드
+  // Push
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * 전체 데이터 Push
-   *
-   * [Fix 1] Push 성공 후 saveVersion(newVersion) 호출
-   *   - 수정 전: 버전 파일 갱신 없음 → 다음 Pull에서도 구버전 반환 → 재충돌
-   *   - 수정 후: 새 버전을 파일에 저장 → 이후 Pull/Diff에서 정확한 버전 사용
-   *
-   * @param {Object} data - { baseVersion, rules, tags, force }
-   * @returns {Promise<Object>}
-   */
   async push(data) {
     await this.ensureInitialized();
 
@@ -367,7 +391,6 @@ export class DataService {
       `태그 ${Object.keys(tags.tags || {}).length}개`,
     );
 
-    // 버전 충돌 확인 (force가 아닌 경우)
     if (!force && baseVersion) {
       const currentVersion = await this.getCurrentVersion();
       if (baseVersion < currentVersion) {
@@ -384,27 +407,32 @@ export class DataService {
       }
     }
 
-    // 자동 백업
-    let backupPath = null;
+    // [Fix #7] 자동 백업 (Qdrant에 저장)
+    let backupId = null;
     if (config.sync.autoBackup) {
-      backupPath = await this.createBackup();
+      backupId = await this.createBackup();
     }
 
     try {
-      // 규칙 전체 교체
+      // 규칙 전체 교체 (deleteAll → saveAll)
+      // Push 직전 백업이 생성되므로 실패 시 복구 가능
       await this.ruleRepository.deleteAll();
       const ruleResult = await this.ruleRepository.saveAll(rules);
 
-      // 태그 전체 교체
       if (tags && Object.keys(tags).length > 0) {
         await this.tagRepository.replaceAllData(tags);
       }
 
-      // [Fix 1] 새 버전 생성 후 파일에 저장
-      //   이전: const newVersion = Date.now(); (저장 없음)
-      //   이후: saveVersion()으로 영속화
       const newVersion = Date.now();
       await this.saveVersion(newVersion);
+
+      // 싱글톤 전체 리셋
+      resetTagDefinitionLoader();
+      resetCodeTagger();
+      resetQdrantRuleRepository();
+      resetCodeChecker();
+      resetCheckService();
+      logger.info('[DataService] 전체 싱글톤 리셋 완료 (다음 검사 시 재초기화)');
 
       logger.info(
         `[DataService] Push 완료: 규칙 ${ruleResult.success}/${rules.length}, 버전 ${newVersion}`,
@@ -414,7 +442,7 @@ export class DataService {
         success:    true,
         newVersion,
         pushedAt:   new Date().toISOString(),
-        backupPath,
+        backupId,
         rules: {
           total:   rules.length,
           success: ruleResult.success,
@@ -428,10 +456,8 @@ export class DataService {
     } catch (error) {
       logger.error(`[DataService] Push 실패: ${error.message}`);
 
-      // 백업에서 복구 시도
-      if (backupPath) {
-        logger.info('[DataService] 백업에서 복구 시도...');
-        // TODO: 복구 로직
+      if (backupId) {
+        logger.info(`[DataService] 백업 ID: ${backupId} (수동 복구 가능)`);
       }
 
       throw error;
@@ -446,54 +472,28 @@ export class DataService {
    * 백업 생성
    * @private
    */
+  /**
+   * 백업 생성
+   * 
+   * [Fix #7] /tmp/backup → Qdrant에 저장 (재시작 내성)
+   * @private
+   * @returns {Promise<string>} 백업 ID
+   */
   async createBackup() {
-    const timestamp  = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupDir  = config.paths.backup;
-    const backupPath = path.join(backupDir, `backup_${timestamp}.json`);
-
-    await fs.mkdir(backupDir, { recursive: true });
-
     const rules = await this.ruleRepository.findAll();
     const tags  = await this.tagRepository.getAllData();
 
     const backupData = {
       backupAt: new Date().toISOString(),
-      version:  Date.now(),
+      version:  await this.loadVersion(),
       rules,
       tags,
     };
 
-    await fs.writeFile(backupPath, JSON.stringify(backupData, null, 2), 'utf-8');
-    logger.info(`[DataService] 백업 생성: ${backupPath}`);
+    const backupId = await this.tagRepository.createBackup(backupData);
+    await this.tagRepository.cleanupOldBackups(config.sync.maxBackups || 10);
 
-    await this.cleanupOldBackups();
-
-    return backupPath;
-  }
-
-  /**
-   * 오래된 백업 정리
-   * @private
-   */
-  async cleanupOldBackups() {
-    const backupDir  = config.paths.backup;
-    const maxBackups = config.sync.maxBackups || 10;
-
-    try {
-      const files       = await fs.readdir(backupDir);
-      const backupFiles = files
-        .filter(f => f.startsWith('backup_') && f.endsWith('.json'))
-        .sort()
-        .reverse();
-
-      for (let i = maxBackups; i < backupFiles.length; i++) {
-        const filePath = path.join(backupDir, backupFiles[i]);
-        await fs.unlink(filePath);
-        logger.debug(`[DataService] 오래된 백업 삭제: ${backupFiles[i]}`);
-      }
-    } catch (error) {
-      logger.warn(`[DataService] 백업 정리 실패: ${error.message}`);
-    }
+    return backupId;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -501,22 +501,12 @@ export class DataService {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * 현재 서버 버전 조회
-   *
-   * [Fix 1] Date.now() 대신 version.json에서 읽도록 변경
-   *   - 수정 전: return Date.now(); → 호출할 때마다 다른 값
-   *   - 수정 후: return this.loadVersion(); → 저장된 버전을 일관되게 반환
-   *
    * @private
-   * @returns {Promise<number>}
    */
   async getCurrentVersion() {
     return await this.loadVersion();
   }
 
-  /**
-   * 통계 조회
-   */
   async getStats() {
     await this.ensureInitialized();
 
@@ -540,10 +530,6 @@ export class DataService {
   // 내부 유틸
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /**
-   * 초기화 확인
-   * @private
-   */
   async ensureInitialized() {
     if (!this.initialized) {
       await this.initialize();
