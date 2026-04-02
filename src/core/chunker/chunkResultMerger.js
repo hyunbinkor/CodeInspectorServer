@@ -6,11 +6,10 @@
  * SARIF 형식으로 출력
  *
  * 변경사항:
- * - [Fix] convertLineNumbers(): 기존 공식 chunk.lineRange.start + issue.line - 1 은
- *   codeWithHeader의 import 헤더 줄 수를 무시하므로 라인이 뒤로 밀리고
- *   파일 총 라인 수를 초과하는 번호가 발생함.
- *   올바른 공식: rangeStart + (issue.line - headerLineCount) - 1
- *   + 메서드 범위 내로 클램핑 처리 추가
+ * - [Fix] convertLineNumbers(): LLM에 메서드 코드만 전송하도록 변경됨에 따라
+ *   headerLineCount 역산 로직 제거.
+ *   LLM이 메서드 코드 기준 1-based 라인을 반환하므로
+ *   단순 공식: rangeStart + issue.line - 1
  *
  * @module chunker/chunkResultMerger
  */
@@ -98,44 +97,27 @@ export class ChunkResultMerger {
   }
 
   /**
-   * 라인 번호 변환 (codeWithHeader 기준 → 원본 파일 기준)
+   * 라인 번호 변환 (메서드 코드 기준 → 원본 파일 기준)
    *
-   * ┌─ codeWithHeader 구조 ───────────────────────────────────────────┐
-   * │  line 1 ~ headerLineCount   : import 블록 + "// Class: X" 주석  │
-   * │  line headerLineCount+1 ~   : 실제 메서드 코드                   │
-   * │                               ↑ 이 줄이 lineRange.start 에 대응 │
-   * └────────────────────────────────────────────────────────────────-┘
+   * LLM에 메서드 코드(chunk.code)만 전송하므로,
+   * LLM이 반환하는 line은 메서드 코드 기준 1-based.
    *
-   * 올바른 공식: rangeStart + (issue.line - headerLineCount) - 1
+   * 공식: rangeStart + issue.line - 1
    *
-   * 기존 공식:   rangeStart + issue.line - 1
-   *   → headerLineCount(import 줄 수 + 3) 만큼 라인이 뒤로 밀림
-   *   → 파일 총 라인 수를 초과하는 번호 발생
-   *
-   * 예시 (import 30줄, 메서드 원본 500번 줄):
-   *   headerText = 30줄 + '\n\n// Class...\n\n' → headerLineCount = 33
-   *   LLM이 codeWithHeader 기준 line 40 리포트
-   *   - 기존: 500 + 40 - 1        = 539  ✗
-   *   - 수정: 500 + (40 - 33) - 1 = 506  ✓
+   * 예시 (메서드가 원본 파일 100번 줄에서 시작):
+   *   LLM이 line 3 리포트 → 100 + 3 - 1 = 102
    */
   convertLineNumbers(issues, chunk) {
-    const headerLineCount = chunk.headerLineCount || 0;
-    const rangeStart      = chunk.lineRange?.start || 1;
-    const rangeEnd        = chunk.lineRange?.end   || rangeStart;
+    const rangeStart = chunk.lineRange?.start || 1;
+    const rangeEnd   = chunk.lineRange?.end   || rangeStart;
 
     return issues.map(issue => {
-      let originalLine;
-
       if (!issue.line) {
         // 라인 정보 없음 → 메서드 시작 라인으로 대체
-        originalLine = rangeStart;
-      } else if (headerLineCount > 0) {
-        // codeWithHeader 사용 청크: 헤더 오프셋 제거
-        originalLine = rangeStart + (issue.line - headerLineCount) - 1;
-      } else {
-        // chunk.code 만 사용한 경우 (headerLineCount = 0): 기존 공식 유지
-        originalLine = rangeStart + issue.line - 1;
+        return { ...issue, line: rangeStart };
       }
+
+      const originalLine = rangeStart + issue.line - 1;
 
       // 클램핑: 메서드 범위 내로 제한 (음수 / 범위 초과 방지)
       const clampedLine = Math.max(rangeStart, Math.min(originalLine, rangeEnd));
@@ -149,8 +131,7 @@ export class ChunkResultMerger {
 
       return {
         ...issue,
-        line:      clampedLine,
-        chunkLine: issue.line   // 디버깅용: codeWithHeader 기준 원래 값
+        line: clampedLine
       };
     });
   }

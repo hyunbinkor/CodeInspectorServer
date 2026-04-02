@@ -11,9 +11,9 @@
  *
  * 변경사항:
  * - [Fix] checkCodeDirect(): limit 50 → 200, tags 누락 인수 추가
- * - [Fix] checkCodeChunked(): checkCodeDirect 호출 시 tags 인수 전달
- * - [Fix] verifyWithLLM(): addLineNumbers()로 번호 붙인 코드 LLM 전달
- * - [Fix] buildSingleRulePrompt(): 코드 블록 헤더에 라인번호 안내 추가
+ * - [Fix] checkCodeChunked(): chunk.code만 전송, import/클래스명은 chunkContext로 별도 전달
+ * - [Fix] verifyWithLLM(): chunkContext를 buildSingleRulePrompt까지 전달
+ * - [Fix] buildSingleRulePrompt(): chunkContext 섹션 추가, 프롬프트 문구 수정
  * - [Fix #1] Repository 패턴 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
  * - [Fix #2] matchesContextualCondition: 조건 없는 규칙 통과
  * - [Fix #3] llm_with_regex antiPatterns 없을 때 llm_contextual 폴백
@@ -283,10 +283,15 @@ export class CodeChecker {
       logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName}] 검사 중...`);
 
       try {
-        const chunkCode = chunk.codeWithHeader || chunk.code;
+        // ✅ [Fix] 메서드 코드만 전송, import/클래스명은 chunkContext로 별도 전달
+        const chunkCode = chunk.code;
 
         const result = await this.checkCodeDirect(chunkCode, fileName, {
-          onProgress: (event) => onProgress({ ...event, stage: 'chunk_llm' })
+          onProgress: (event) => onProgress({ ...event, stage: 'chunk_llm' }),
+          chunkContext: {
+            className: chunk.className,
+            imports:   chunkingResult.header
+          }
         });
 
         chunkResults.push({
@@ -384,9 +389,10 @@ export class CodeChecker {
     const issues = [...filterResult.pureRegexViolations];
 
     // Step 6: LLM 검증
+    // ✅ [Fix] options를 verifyWithLLM에 전달하여 chunkContext가 프롬프트까지 도달
     if (filterResult.llmCandidates.total > 0) {
       const llmViolations = await this.verifyWithLLM(
-        code, astAnalysis, filterResult.llmCandidates, fileName, tags, onProgress
+        code, astAnalysis, filterResult.llmCandidates, fileName, tags, onProgress, options
       );
       issues.push(...llmViolations);
     }
@@ -734,7 +740,18 @@ export class CodeChecker {
   // LLM 검증
   // ═══════════════════════════════════════════════════════════════════════════
 
-  async verifyWithLLM(sourceCode, astAnalysis, llmCandidates, fileName, tags, onProgress = () => {}) {
+  /**
+   * LLM 개별 규칙 검증
+   *
+   * @param {string}   sourceCode    - 검사 대상 코드 (메서드 코드만, import 미포함)
+   * @param {Object}   astAnalysis   - AST 분석 결과
+   * @param {Object}   llmCandidates - 사전 필터링된 후보
+   * @param {string}   fileName      - 파일명
+   * @param {string[]} tags          - 태그 배열
+   * @param {Function} onProgress    - 진행 콜백
+   * @param {Object}   options       - 옵션 (chunkContext 포함 가능)
+   */
+  async verifyWithLLM(sourceCode, astAnalysis, llmCandidates, fileName, tags, onProgress = () => {}, options = {}) {
     const violations = [];
 
     const allItems = [
@@ -753,6 +770,9 @@ export class CodeChecker {
     // ✅ [Fix] LLM에게 라인 번호가 붙은 코드를 전달
     const numberedCode = addLineNumbers(truncatedCode, 1);
 
+    // ✅ [Fix] 청킹 시 import/클래스명 컨텍스트
+    const chunkContext = options.chunkContext || null;
+
     for (let i = 0; i < allItems.length; i++) {
       const item          = allItems[i];
       const rule          = item.rule;
@@ -760,7 +780,7 @@ export class CodeChecker {
       const itemStartTime = Date.now();
 
       try {
-        const prompt = this.buildSingleRulePrompt(numberedCode, item, astAnalysis, tags);
+        const prompt = this.buildSingleRulePrompt(numberedCode, item, astAnalysis, tags, chunkContext);
 
         const startTime = Date.now();
         const response  = await this.llmClient.generateCompletion(prompt, {
@@ -833,29 +853,36 @@ export class CodeChecker {
    * 단일 규칙 검증 프롬프트
    *
    * sourceCode 는 addLineNumbers() 로 이미 번호가 붙어 있음.
+   *
+   * @param {string}      sourceCode   - 라인 번호가 붙은 코드
+   * @param {Object}      item         - 검증 대상 (rule + candidates 등)
+   * @param {Object}      astAnalysis  - AST 분석 결과
+   * @param {string[]}    tags         - 태그 배열
+   * @param {Object|null} chunkContext - 청킹 시 클래스명/import 정보 (null이면 비청킹)
    */
-  buildSingleRulePrompt(sourceCode, item, astAnalysis, tags) {
+  buildSingleRulePrompt(sourceCode, item, astAnalysis, tags, chunkContext) {
     const rule = item.rule;
     const type = item.type;
 
     const astSection            = this._buildAstSection(astAnalysis);
     const detectedIssuesSection = this._buildDetectedIssuesSection(astAnalysis, rule);
     const profileSection        = this._buildProfileSection(tags);
+    const chunkContextSection   = this._buildChunkContextSection(chunkContext);
     const examplesSection       = this._buildExamplesSection(rule);
     const contextSection        = this._buildContextSection(item, type);
     const falsePositiveGuide    = this._buildFalsePositiveGuide();
 
-    // ✅ [Fix] 코드 블록 헤더에 라인번호 안내 추가
     return `다음 Java 코드가 주어진 규칙을 위반하는지 검사하세요.
 ${astSection}
 ${detectedIssuesSection}
 ${profileSection}
+${chunkContextSection}
 
-## 검사 대상 코드 (각 줄 앞의 숫자가 실제 라인 번호입니다)
+## 검사 대상 코드
 \`\`\`java
 ${sourceCode}
 \`\`\`
-주의: line 필드에는 위 코드에 표시된 라인 번호를 그대로 입력하세요.
+주의: line 필드에는 위 코드의 줄 번호(각 줄 앞의 숫자)를 그대로 입력하세요.
 
 ## 검사 규칙
 - ID: ${rule.ruleId}
@@ -903,6 +930,22 @@ ${falsePositiveGuide}
     const displayTags = tags.slice(0, 15).join(', ');
     const extra       = tags.length > 15 ? `, ... 외 ${tags.length - 15}개` : '';
     return `\n## 코드 프로파일\n- **태그:** ${displayTags}${extra}`;
+  }
+
+  /**
+   * 청킹 시 클래스명/import 정보를 별도 섹션으로 제공
+   * LLM이 메서드 코드만 보더라도 import/클래스 맥락을 파악할 수 있게 함
+   */
+  _buildChunkContextSection(chunkContext) {
+    if (!chunkContext) return '';
+    const parts = [];
+    if (chunkContext.className) {
+      parts.push(`- **클래스명:** ${chunkContext.className}`);
+    }
+    if (chunkContext.imports) {
+      parts.push(`- **import문:**\n\`\`\`java\n${chunkContext.imports}\n\`\`\``);
+    }
+    return parts.length > 0 ? `\n## 코드 컨텍스트\n${parts.join('\n')}` : '';
   }
 
   _buildExamplesSection(rule) {
