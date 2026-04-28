@@ -233,62 +233,22 @@ export class CodeChecker {
     }
 
     // ─── 일반 모드 ────────────────────────────────────────────────────────
-    this._getStats().totalChecks++;
-
-    logger.debug(`[${fileName}] 태깅 시작...`);
-    const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
-    const tags          = taggingResult.tags;
-    logger.info(`[${fileName}] 태그 ${tags.length}개: ${tags.slice(0, 5).join(', ')}...`);
-
-    onProgress({ stage: 'tagging', status: 'done', tagCount: tags.length, elapsed: Date.now() - startTime });
-
-    const astResult   = this.astParser.parseJavaCode(code);
-    const astAnalysis = astResult.analysis;
-
-    logger.debug(`[${fileName}] 룰 조회...`);
-    // [Fix #1] Repository 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
-    // [Fix #11] scoreThreshold 제거 — scroll API는 벡터 유사도 검색이 아닌 필터 기반 전수 조회이므로 무의미
-    const matchedRules = await this.ruleRepository.findByTags(tags, { limit: 10000 });
-    logger.info(`[${fileName}] 매칭 룰: ${matchedRules.length}개`);
-
-    onProgress({ stage: 'rules', status: 'done', matchedRules: matchedRules.length, elapsed: Date.now() - startTime });
-
-    if (matchedRules.length === 0) {
-      const report = this.resultBuilder.buildReport({ fileName, code, tags, matchedRules: [], issues: [], duration: Date.now() - startTime });
-      return report;
-    }
-
-    const filterResult = this.preFilterRules(code, astAnalysis, matchedRules, tags);
-
-    onProgress({
-      stage:            'filtering',
-      status:           'done',
-      pureRegexIssues:  filterResult.pureRegexViolations.length,
-      llmCandidates:    filterResult.llmCandidates.total,
-      elapsed:          Date.now() - startTime
-    });
-
-    const issues = [...filterResult.pureRegexViolations];
-
-    if (filterResult.llmCandidates.total > 0) {
-      const llmViolations = await this.verifyWithLLM(
-        code, astAnalysis, filterResult.llmCandidates, fileName, tags, onProgress
-      );
-      issues.push(...llmViolations);
-    }
-
-    const uniqueIssues = this.deduplicateViolations(issues);
+    // [Fix M4] 일반 모드의 검사 흐름을 checkCodeDirect로 단일화.
+    //   기존엔 거의 동일한 로직이 양 함수에 중복 존재했다 (태깅, AST, findByTags,
+    //   preFilterRules, verifyWithLLM, dedup). progress 이벤트와 ResultBuilder
+    //   래핑만 _checkCodeInner에서 담당하고 실제 검사 본체는 checkCodeDirect로 위임.
+    const directResult = await this.checkCodeDirect(code, fileName, { onProgress });
 
     const report = this.resultBuilder.buildReport({
       fileName,
       code,
-      tags,
-      matchedRules,
-      issues:   uniqueIssues,
-      duration: Date.now() - startTime
+      tags:         directResult.tags || [],
+      matchedRules: directResult.matchedRules || [],
+      issues:       directResult.issues || [],
+      duration:     Date.now() - startTime
     });
 
-    logger.info(`[${fileName}] 이슈 ${uniqueIssues.length}개 발견 (${Date.now() - startTime}ms)`);
+    logger.info(`[${fileName}] 이슈 ${(directResult.issues || []).length}개 발견 (${Date.now() - startTime}ms)`);
     return report;
   }
 
@@ -438,7 +398,20 @@ export class CodeChecker {
   }
 
   /**
-   * 직접 코드 검사 (청킹 없이 — 개별 청크 검사에 사용)
+   * 직접 코드 검사 (청킹 없이) — 일반 모드와 청크별 검사 모두의 단일 진입점.
+   *
+   * [Fix M4] checkCode 일반 모드와의 로직 중복을 통합. progress 이벤트
+   *   ('tagging', 'rules', 'filtering')도 여기서 발행하여 일반 모드 호출 시
+   *   기존과 동일한 SSE 스트리밍을 유지한다.
+   *
+   * @param {string} code     - 검사 대상 코드
+   * @param {string} fileName - 파일명 (로그/리포트용)
+   * @param {Object} options
+   *   - onProgress: progress 이벤트 콜백
+   *   - chunkContext: { className } 청킹 시 LLM 프롬프트 컨텍스트
+   *   - globalTags: string[] 청킹 시 파일 전체 태그 (C1)
+   *   - skipLLM: boolean header/footer 청크 처리용 (H2)
+   * @returns {Promise<{success, issues, tags, matchedRules, stats}>}
    */
   async checkCodeDirect(code, fileName, options = {}) {
     const startTime  = Date.now();
@@ -446,6 +419,7 @@ export class CodeChecker {
     this._getStats().totalChecks++;
 
     // Step 1: 코드 태깅 (local — 청크 코드 자체에서 추출)
+    logger.debug(`[${fileName}] 태깅 시작...`);
     const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
     const localTags     = taggingResult.tags;
 
@@ -456,6 +430,11 @@ export class CodeChecker {
     const globalTags = options.globalTags || [];
     const tags = [...new Set([...globalTags, ...localTags])];
 
+    if (tags.length > 0) {
+      logger.info(`[${fileName}] 태그 ${tags.length}개: ${tags.slice(0, 5).join(', ')}${tags.length > 5 ? ', ...' : ''}`);
+    }
+    onProgress({ stage: 'tagging', status: 'done', tagCount: tags.length, elapsed: Date.now() - startTime });
+
     // Step 2: AST 분석
     const astResult   = this.astParser.parseJavaCode(code);
     const astAnalysis = astResult.analysis;
@@ -463,17 +442,27 @@ export class CodeChecker {
     // Step 3: 태그 기반 룰 조회
     // [Fix #1] Repository 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
     // [Fix #11] scoreThreshold 제거 — scroll API는 필터 기반 전수 조회
+    logger.debug(`[${fileName}] 룰 조회...`);
     const matchedRules = await this.ruleRepository.findByTags(tags, {
       limit: 10000
     });
+    logger.info(`[${fileName}] 매칭 룰: ${matchedRules.length}개`);
+    onProgress({ stage: 'rules', status: 'done', matchedRules: matchedRules.length, elapsed: Date.now() - startTime });
 
     if (matchedRules.length === 0) {
-      return { success: true, issues: [], stats: { llmCalls: 0 } };
+      return { success: true, issues: [], tags, matchedRules: [], stats: { llmCalls: 0 } };
     }
 
     // Step 4: 사전 필터링
     // [Fix] tags 인수 추가 (기존 누락으로 llm_contextual 규칙이 전부 스킵됨)
     const filterResult = this.preFilterRules(code, astAnalysis, matchedRules, tags);
+    onProgress({
+      stage:           'filtering',
+      status:          'done',
+      pureRegexIssues: filterResult.pureRegexViolations.length,
+      llmCandidates:   filterResult.llmCandidates.total,
+      elapsed:         Date.now() - startTime
+    });
 
     // Step 5: pure_regex 위반 수집
     const issues = [...filterResult.pureRegexViolations];
@@ -495,6 +484,8 @@ export class CodeChecker {
     return {
       success: true,
       issues:  uniqueIssues,
+      tags,
+      matchedRules,
       stats:   { llmCalls: this._getStats().llmCalls, llmCandidates: filterResult.llmCandidates.total }
     };
   }
