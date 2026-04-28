@@ -4,14 +4,6 @@
 
 ## 🔴 Critical — 검사 정확도/안정성에 직접 영향
 
-### C1. 청킹 모드에서 클래스 레벨 태그 누락
-
-**위치**: `src/core/checker/codeChecker.js` (`checkCodeChunked` → `checkCodeDirect`)
-
-청킹 진입 시 각 청크는 메서드 본문만 받아 태깅됨. `@Service`, `class XXX extends BaseDAO` 등의 클래스 레벨 정보가 떨어져 나가 `IS_DAO`, `IS_SERVICE`, `IS_CONTROLLER` 태그가 안 붙는다. 이들을 `requiredTags`로 요구하는 규칙은 파일 검사(청킹)에서도 누락된다.
-
-**해결 방향**: `checkCodeChunked` 진입 시 원본 코드 전체로 1회 태깅(`globalTags`) → 각 청크 검사 시 `globalTags ∪ localTags`로 규칙 조회.
-
 ### C2. `truncateCode` 후 라인 번호 어긋남
 
 **위치**: `src/core/checker/codeChecker.js:783-786`
@@ -97,7 +89,6 @@ LLM 응답 description에 줄바꿈이 있으면 GitHub Actions가 깨짐. `%0A`
 
 | 코드 | 영향 | 작업량 |
 |---|---|---|
-| C1 | 파일 검사 정확도 ↑↑↑ | 중 |
 | C2 | 선택 검사 6000줄 라인 정확도 | 중~상 |
 | C3 | 동시 요청 안정성 | 하 |
 | H2 | import 규칙 작동 | 하 |
