@@ -11,9 +11,11 @@
  *
  * 변경사항:
  * - [Fix] checkCodeDirect(): limit 50 → 200, tags 누락 인수 추가
- * - [Fix] checkCodeChunked(): chunk.code만 전송, import/클래스명은 chunkContext로 별도 전달
+ * - [Fix] checkCodeChunked(): chunk.code만 전송, 클래스명은 chunkContext로 별도 전달
  * - [Fix] verifyWithLLM(): chunkContext를 buildSingleRulePrompt까지 전달
  * - [Fix] buildSingleRulePrompt(): chunkContext 섹션 추가, 프롬프트 문구 수정
+ * - [Fix] truncateCode(): 100000자 한도, 주석코드 제거, 후보 라인 기반 거리 제거
+ * - [Fix] checkCode(): checkMode 기반 청킹 결정 (file=무조건 청킹, selection=청킹 안 함)
  * - [Fix #1] Repository 패턴 사용 — 가이드라인 + 이슈 컬렉션 모두 조회
  * - [Fix #2] matchesContextualCondition: 조건 없는 규칙 통과
  * - [Fix #3] llm_with_regex antiPatterns 없을 때 llm_contextual 폴백
@@ -166,7 +168,14 @@ export class CodeChecker {
     // [Fix #10] 검사 요청별 통계 리셋 — 이전 검사의 누적값이 남지 않도록
     this.resetFilteringStats();
 
-    const needsChunking = options.forceChunk || this.methodChunker.needsChunking(code);
+    // ✅ [Fix] checkMode 기반 청킹 결정
+    // file      = 무조건 청킹 (파일 전체 검사)
+    // selection = 청킹 안 함 (선택 영역 검사)
+    // auto      = 기존 로직 (줄 수 기반 자동 판단)
+    const checkMode = options.checkMode || 'auto';
+    const needsChunking = checkMode === 'file'      ? true
+                        : checkMode === 'selection'  ? false
+                        : options.forceChunk || this.methodChunker.needsChunking(code);
 
     onProgress({ stage: 'start', fileName, lineCount, chunked: needsChunking, timestamp: Date.now() });
 
@@ -283,14 +292,13 @@ export class CodeChecker {
       logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName}] 검사 중...`);
 
       try {
-        // ✅ [Fix] 메서드 코드만 전송, import/클래스명은 chunkContext로 별도 전달
+        // ✅ [Fix] 메서드 코드만 전송, 클래스명만 chunkContext로 별도 전달 (import 제외)
         const chunkCode = chunk.code;
 
         const result = await this.checkCodeDirect(chunkCode, fileName, {
           onProgress: (event) => onProgress({ ...event, stage: 'chunk_llm' }),
           chunkContext: {
-            className: chunk.className,
-            imports:   chunkingResult.header
+            className: chunk.className
           }
         });
 
@@ -743,7 +751,7 @@ export class CodeChecker {
   /**
    * LLM 개별 규칙 검증
    *
-   * @param {string}   sourceCode    - 검사 대상 코드 (메서드 코드만, import 미포함)
+   * @param {string}   sourceCode    - 검사 대상 코드
    * @param {Object}   astAnalysis   - AST 분석 결과
    * @param {Object}   llmCandidates - 사전 필터링된 후보
    * @param {string}   fileName      - 파일명
@@ -765,12 +773,19 @@ export class CodeChecker {
     const totalItems = allItems.length;
     logger.info(`[${fileName}] LLM 개별 검증 시작: ${allItems.length}개 규칙`);
 
-    const truncatedCode = this.truncateCode(sourceCode, 4000);
+    // ✅ [Fix] 후보 라인 수집 + truncation 모드 결정
+    const preserveLines = allItems
+      .filter(i => i.candidates)
+      .flatMap(i => i.candidates.map(c => c.line))
+      .filter(Boolean);
+
+    const isChunked = !!options.chunkContext;
+    const truncatedCode = this.truncateCode(sourceCode0000, preserveLines, { chunked: isChunked });
 
     // ✅ [Fix] LLM에게 라인 번호가 붙은 코드를 전달
     const numberedCode = addLineNumbers(truncatedCode, 1);
 
-    // ✅ [Fix] 청킹 시 import/클래스명 컨텍스트
+    // ✅ [Fix] 청킹 시 클래스명 컨텍스트
     const chunkContext = options.chunkContext || null;
 
     for (let i = 0; i < allItems.length; i++) {
@@ -858,7 +873,7 @@ export class CodeChecker {
    * @param {Object}      item         - 검증 대상 (rule + candidates 등)
    * @param {Object}      astAnalysis  - AST 분석 결과
    * @param {string[]}    tags         - 태그 배열
-   * @param {Object|null} chunkContext - 청킹 시 클래스명/import 정보 (null이면 비청킹)
+   * @param {Object|null} chunkContext - 청킹 시 클래스명 정보 (null이면 비청킹)
    */
   buildSingleRulePrompt(sourceCode, item, astAnalysis, tags, chunkContext) {
     const rule = item.rule;
@@ -933,19 +948,12 @@ ${falsePositiveGuide}
   }
 
   /**
-   * 청킹 시 클래스명/import 정보를 별도 섹션으로 제공
-   * LLM이 메서드 코드만 보더라도 import/클래스 맥락을 파악할 수 있게 함
+   * 청킹 시 클래스명 정보를 별도 섹션으로 제공
    */
   _buildChunkContextSection(chunkContext) {
     if (!chunkContext) return '';
-    const parts = [];
-    if (chunkContext.className) {
-      parts.push(`- **클래스명:** ${chunkContext.className}`);
-    }
-    if (chunkContext.imports) {
-      parts.push(`- **import문:**\n\`\`\`java\n${chunkContext.imports}\n\`\`\``);
-    }
-    return parts.length > 0 ? `\n## 코드 컨텍스트\n${parts.join('\n')}` : '';
+    if (!chunkContext.className) return '';
+    return `\n## 코드 컨텍스트\n- **클래스명:** ${chunkContext.className}`;
   }
 
   _buildExamplesSection(rule) {
@@ -1124,12 +1132,151 @@ ${rulesDescription}
     });
   }
 
-  truncateCode(code, maxLength) {
+  /**
+   * 코드 truncation (3단계)
+   *
+   * Step 1: 100000자 이하면 전체 투입
+   * Step 2: 주석 처리된 코드 제거 (이중주석, 주석코드 등)
+   * Step 3: 후보 라인에서 먼 줄부터 제거
+   *         - chunked=true  (파일 검사): 메서드 시그니처 보존 + 후보 가까운 줄 보존
+   *         - chunked=false (선택 검사): 후보 가까운 줄만 보존
+   *
+   * @param {string}   code          - 소스 코드
+   * @param {number}   maxLength     - 최대 글자 수
+   * @param {number[]} preserveLines - 반드시 보존할 라인 번호 (1-based)
+   * @param {Object}   options       - { chunked: boolean }
+   * @returns {string} 잘린 코드
+   */
+  truncateCode(code, maxLength, preserveLines = [], options = {}) {
+    // ─── Step 1: 전체 코드 투입 시도 ─────────────────────────────────
     if (!code || code.length <= maxLength) return code;
-    const half  = Math.floor(maxLength / 2);
-    const start = code.substring(0, half);
-    const end   = code.substring(code.length - half);
-    return `${start}\n\n// ... (${code.length - maxLength} characters truncated) ...\n\n${end}`;
+
+    const lines = code.split('\n');
+
+    // ─── Step 2: 주석 처리된 코드 제거 ───────────────────────────────
+    const cleanedFlags = new Array(lines.length).fill(true);
+
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+
+      // 이중 주석: // //
+      if (/^\/\/\s*\/\//.test(trimmed)) {
+        cleanedFlags[i] = false;
+        continue;
+      }
+
+      // 주석 처리된 코드: // ... ;
+      if (/^\/\/\s*.*;\s*$/.test(trimmed)) {
+        cleanedFlags[i] = false;
+        continue;
+      }
+
+      // 주석 처리된 코드: // ... {
+      if (/^\/\/\s*.*\{\s*$/.test(trimmed)) {
+        cleanedFlags[i] = false;
+        continue;
+      }
+
+      // 주석 처리된 코드: // ... }
+      if (/^\/\/\s*.*\}\s*$/.test(trimmed)) {
+        cleanedFlags[i] = false;
+        continue;
+      }
+
+      // 주석 처리된 제어문: // if ..., // else ...
+      if (/^\/\/\s*(if|else)\s/.test(trimmed)) {
+        cleanedFlags[i] = false;
+        continue;
+      }
+    }
+
+    const afterCommentClean = [];
+    const lineMapping = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      if (cleanedFlags[i]) {
+        afterCommentClean.push(lines[i]);
+        lineMapping.push(i);
+      }
+    }
+
+    const cleanedCode = afterCommentClean.join('\n');
+    if (cleanedCode.length <= maxLength) return cleanedCode;
+
+    // ─── Step 3: 후보 라인에서 먼 줄부터 제거 ────────────────────────
+    if (preserveLines.length === 0) {
+      // 보존 라인 없으면 앞뒤 폴백
+      const half  = Math.floor(maxLength / 2);
+      const start = cleanedCode.substring(0, half);
+      const end   = cleanedCode.substring(cleanedCode.length - half);
+      return `${start}\n\n// ... (${cleanedCode.length - maxLength} characters truncated) ...\n\n${end}`;
+    }
+
+    const isChunked = options.chunked || false;
+    const distances = new Array(afterCommentClean.length).fill(Infinity);
+    const mustKeep = new Set();
+
+    for (let i = 0; i < afterCommentClean.length; i++) {
+      const originalLineNum = lineMapping[i] + 1;  // 1-based
+
+      // 청킹 모드: 메서드 시그니처 (첫 20줄, 마지막 5줄) 보존
+      if (isChunked && (i < 20 || i >= afterCommentClean.length - 5)) {
+        mustKeep.add(i);
+        distances[i] = 0;
+        continue;
+      }
+
+      // 후보 라인 자체는 반드시 보존
+      if (preserveLines.includes(originalLineNum)) {
+        mustKeep.add(i);
+        distances[i] = 0;
+        continue;
+      }
+
+      // 가장 가까운 후보 라인까지의 거리
+      let minDist = Infinity;
+      for (const pLine of preserveLines) {
+        const dist = Math.abs(originalLineNum - pLine);
+        if (dist < minDist) minDist = dist;
+      }
+      distances[i] = minDist;
+    }
+
+    // 거리 먼 순으로 정렬 (제거 우선순위)
+    const removable = [];
+    for (let i = 0; i < afterCommentClean.length; i++) {
+      if (!mustKeep.has(i)) {
+        removable.push(i);
+      }
+    }
+    removable.sort((a, b) => distances[b] - distances[a]);
+
+    // 먼 줄부터 하나씩 제거하면서 한도 체크
+    const keepFlags = new Array(afterCommentClean.length).fill(true);
+    let currentLength = cleanedCode.length;
+
+    for (const idx of removable) {
+      if (currentLength <= maxLength) break;
+      keepFlags[idx] = false;
+      currentLength -= (afterCommentClean[idx].length + 1);  // +1 for \n
+    }
+
+    // 결과 조합
+    const resultParts = [];
+    let lastKeptIdx = -1;
+
+    for (let i = 0; i < afterCommentClean.length; i++) {
+      if (!keepFlags[i]) continue;
+
+      if (lastKeptIdx >= 0 && i > lastKeptIdx + 1) {
+        const skipped = i - lastKeptIdx - 1;
+        resultParts.push(`// ... (${skipped}줄 생략) ...`);
+      }
+      resultParts.push(afterCommentClean[i]);
+      lastKeptIdx = i;
+    }
+
+    return resultParts.join('\n');
   }
 
   _truncateText(text, maxLen) {

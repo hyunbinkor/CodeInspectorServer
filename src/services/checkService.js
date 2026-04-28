@@ -38,13 +38,14 @@ export class CheckService {
   }
 
   /**
-   * 코드 검사 실행 (기존 - 변경 없음)
+   * 코드 검사 실행
    * 
    * @param {string} code - Java 소스 코드
    * @param {string} fileName - 파일명
    * @param {Object} options - 검사 옵션
    * @param {string} options.format - 출력 형식 (json, sarif, github)
    * @param {boolean} options.forceChunk - 강제 청킹 여부
+   * @param {string} options.checkMode - 검사 모드 ('file' | 'selection' | 'auto')
    * @returns {Promise<Object>} 검사 결과
    */
   async checkCode(code, fileName = 'unknown.java', options = {}) {
@@ -59,7 +60,8 @@ export class CheckService {
       // codeChecker.checkCode() 호출
       const result = await this.codeChecker.checkCode(code, fileName, {
         forceChunk: options.forceChunk,
-        outputFormat: outputFormat
+        outputFormat: outputFormat,
+        checkMode: options.checkMode || 'auto'
       });
 
       const elapsed = Date.now() - startTime;
@@ -96,6 +98,7 @@ export class CheckService {
       const result = await this.codeChecker.checkCode(code, fileName, {
         forceChunk: options.forceChunk,
         outputFormat: outputFormat,
+        checkMode: options.checkMode || 'auto',
         onProgress: onProgress  // 콜백 전달
       });
 
