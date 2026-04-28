@@ -71,26 +71,17 @@ export class MethodChunker {
       logger.info(`[MethodChunker] ${methods.length}개 메서드 발견`);
     }
 
-    methods.forEach((method, index) => {
+    // [Fix M2] codeWithHeader / headerLineCount 레거시 제거.
+    //   이전엔 LLM에 import + "// Class: X" 헤더를 prepend해서 보냈고
+    //   convertLineNumbers가 headerLineCount만큼 빼서 원본 라인을 복원했다.
+    //   현재는 메서드 코드(chunk.code)만 LLM에 전송하고 className은 chunkContext로
+    //   별도 전달하는 구조로 바뀌어 두 필드 모두 미사용 상태. 여기서 정리한다.
+    methods.forEach((method) => {
       const methodCode = method.lines.join('\n');
-
-      // ✅ [Fix] headerText를 변수로 분리 → headerLineCount 계산 가능하게
-      //
-      // codeWithHeader 구조:
-      //   line 1 ~ headerLineCount   : import 블록 + "// Class: X" 주석 (LLM 컨텍스트용)
-      //   line headerLineCount+1 ~   : 실제 메서드 코드 (여기가 lineRange.start에 대응)
-      //
-      // headerLineCount가 없으면 convertLineNumbers()에서 원본 라인 변환 시
-      // import 줄 수만큼 오프셋이 더해져 라인이 뒤로 밀리고
-      // 파일 총 라인 수를 초과하는 번호가 생성됨
-      const headerText = `${importBlock.join('\n')}\n\n// Class: ${className}\n\n`;
-      const headerLineCount = headerText.split('\n').length;
 
       chunks.push({
         index: chunks.length,
         code: methodCode,
-        codeWithHeader: `${headerText}${methodCode}`,
-        headerLineCount,            // ← 추가: convertLineNumbers에서 헤더 offset 제거에 사용
         lineRange: {
           start: method.startLine + 1,  // 1-based
           end: method.endLine + 1

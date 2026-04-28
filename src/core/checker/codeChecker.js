@@ -954,7 +954,6 @@ export class CodeChecker {
     const type = item.type;
 
     const astSection            = this._buildAstSection(astAnalysis);
-    const detectedIssuesSection = this._buildDetectedIssuesSection(astAnalysis, rule);
     const profileSection        = this._buildProfileSection(tags);
     const chunkContextSection   = this._buildChunkContextSection(chunkContext);
     const examplesSection       = this._buildExamplesSection(rule);
@@ -963,7 +962,6 @@ export class CodeChecker {
 
     return `다음 Java 코드가 주어진 규칙을 위반하는지 검사하세요.
 ${astSection}
-${detectedIssuesSection}
 ${profileSection}
 ${chunkContextSection}
 
@@ -1004,14 +1002,6 @@ ${falsePositiveGuide}
     if (astAnalysis.maxNestingDepth) parts.push(`- 최대 중첩 깊이: ${astAnalysis.maxNestingDepth}`);
     if (astAnalysis.methodCount) parts.push(`- 메서드 수: ${astAnalysis.methodCount}`);
     return parts.length > 0 ? `\n## AST 분석 정보\n${parts.join('\n')}` : '';
-  }
-
-  _buildDetectedIssuesSection(astAnalysis, rule) {
-    if (!astAnalysis?.detectedIssues) return '';
-    const relevant = astAnalysis.detectedIssues.filter(i => i.ruleId === rule.ruleId);
-    if (relevant.length === 0) return '';
-    const items = relevant.map(i => `- 라인 ${i.line}: ${i.description}`).join('\n');
-    return `\n## AST가 감지한 관련 이슈\n${items}\n\n규칙 위반 판단 시 참고하세요.`;
   }
 
   _buildProfileSection(tags) {
@@ -1196,12 +1186,20 @@ ${rulesDescription}
 
   // ─── 유틸리티 ────────────────────────────────────────────────────────────────
 
+  /**
+   * 중복 이슈 제거.
+   * [Fix H5] chunkResultMerger.deduplicateIssues와 키 형식을 통일.
+   *   기존: `${line}-${ruleId}-${column||0}` (codeChecker)
+   *         vs `${ruleId}-${line}-${desc50}` (chunkResultMerger)
+   *   통일: `${ruleId}@${line}:${column||0}`
+   *   description은 LLM이 매번 다르게 생성하므로 키에서 제외.
+   */
   deduplicateViolations(violations) {
-    const seen = new Map();
+    const seen = new Set();
     return violations.filter(violation => {
-      const key = `${violation.line}-${violation.ruleId}-${violation.column || 0}`;
+      const key = `${violation.ruleId}@${violation.line}:${violation.column || 0}`;
       if (seen.has(key)) return false;
-      seen.set(key, true);
+      seen.add(key);
       return true;
     });
   }
