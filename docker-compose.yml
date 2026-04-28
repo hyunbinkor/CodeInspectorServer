@@ -15,22 +15,23 @@ services:
     image: code-quality-server:1.0.0
     container_name: code-quality-api
     
-    # 환경 변수 (내부망 주소로 수정 필요)
+    # 환경 변수 — 실제 값은 .env 또는 운영 배포 시 주입
+    # (.env 파일이 같은 디렉토리에 있으면 docker compose가 자동 로드)
     environment:
       - NODE_ENV=production
       - PORT=3000
       - HOST=0.0.0.0
-      
-      # vLLM 서버 주소 (내부망)
-      - VLLM_BASE_URL=http://10.131.48.41:11434
-      - VLLM_MODEL=ShcCodeAssistant
+
+      # vLLM 서버 (.env 또는 운영 배포에서 실제 주소 주입)
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://CHANGE_ME:11434}
+      - VLLM_MODEL=${VLLM_MODEL:-CHANGE_ME}
       - VLLM_TIMEOUT=180000
-      
-      # Qdrant 서버 주소 (내부망)
-      - QDRANT_HOST=qdrant-server
-      - QDRANT_PORT=433
-      - QDRANT_COLLECTION=rules          # 기존 가이드라인 컬렉션
-      - QDRANT_ISSUE_COLLECTION=issues   # 이슈 기반 컬렉션명 (실제 이름으로 변경)
+
+      # Qdrant 서버
+      - QDRANT_HOST=${QDRANT_HOST:-CHANGE_ME}
+      - QDRANT_PORT=${QDRANT_PORT:-443}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-rules}          # 가이드라인 규칙 컬렉션
+      - QDRANT_ISSUE_COLLECTION=${QDRANT_ISSUE_COLLECTION:-issues}   # 이슈 기반 컬렉션
       
       # 로깅
       - LOG_LEVEL=info

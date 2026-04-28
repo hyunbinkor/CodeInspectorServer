@@ -69,14 +69,15 @@ ENV NODE_TLS_REJECT_UNAUTHORIZED=0
 ENV BACKUP_PATH=/tmp/backup
 ENV TAGS_PATH=/tmp/tags
 
-# ─── vLLM 설정 (내부망 주소로 수정 필요) ───
-ENV VLLM_BASE_URL=http://10.131.48.41:11434
-ENV VLLM_MODEL=ShcCodeAssistant
+# ─── vLLM 설정 (운영 환경에서 docker run -e로 반드시 주입) ───
+# 기본값은 placeholder. 실제 내부망 주소는 .env 또는 docker run -e VLLM_BASE_URL=... 으로 지정
+ENV VLLM_BASE_URL=http://CHANGE_ME:11434
+ENV VLLM_MODEL=CHANGE_ME
 ENV VLLM_TIMEOUT=180000
 ENV VLLM_MAX_RETRIES=3
 
-# ─── Qdrant 설정 (내부망 주소로 수정 필요) ───
-ENV QDRANT_HOST=qdrant-llm.apps.ocd1.shinhancard.dv
+# ─── Qdrant 설정 (운영 환경에서 docker run -e로 반드시 주입) ───
+ENV QDRANT_HOST=CHANGE_ME
 ENV QDRANT_PORT=443
 ENV QDRANT_HTTPS=true
 ENV QDRANT_COLLECTION=rules
