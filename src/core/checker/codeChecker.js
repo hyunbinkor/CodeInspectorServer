@@ -37,16 +37,8 @@ import { MethodChunker }    from '../chunker/methodChunker.js';
 import { ChunkResultMerger } from '../chunker/chunkResultMerger.js';
 import { getQdrantRuleRepository } from '../../repositories/impl/QdrantRuleRepository.js';  // [Fix #1] Repository 추가
 import { listFiles, readTextFile, writeJsonFile } from '../../utils/fileUtils.js';
-import { createRegexSafe }  from '../../utils/regexUtils.js';
 import { config }           from '../../config/index.js';
 import logger               from '../../utils/loggerUtils.js';
-
-const CHECK_TYPES = {
-  PURE_REGEX:    'pure_regex',
-  LLM_WITH_REGEX: 'llm_with_regex',
-  LLM_CONTEXTUAL: 'llm_contextual',
-  LLM_WITH_AST:   'llm_with_ast'
-};
 
 // [Fix C3] 요청별 stats 격리용 비동기 컨텍스트.
 //   동시 검사 요청이 싱글톤 CodeChecker.filteringStats를 서로 덮어써
@@ -1419,7 +1411,7 @@ ${rulesDescription}
 
   buildSectionedPrompt(sourceCode, llmCandidates) {
     const truncatedCode = this.truncateCode(sourceCode, 3000);
-    let sections = [];
+    const sections = [];
 
     if (llmCandidates.llm_with_regex.length > 0) {
       const regexSection = llmCandidates.llm_with_regex.map(item => {
