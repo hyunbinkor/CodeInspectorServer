@@ -30,14 +30,6 @@
 
 ## 🟡 High — 기능적 결함
 
-### H1. 라우터에서 `checkMode` 미전달
-
-**위치**: `src/api/routes/check.routes.js:128`
-
-`checkService`/`codeChecker`는 `checkMode: 'file' | 'selection' | 'auto'`를 지원하지만, 라우터가 `req.body.options.checkMode`를 추출/전달하지 않음. 클라이언트가 보내도 무시되고 항상 `'auto'`로 처리됨.
-
-**해결 방향**: 한 줄 추가 + 선택 검사 6000줄 hard limit (vLLM 64K 토큰 기준).
-
 ### H2. Header/Footer 청크 검사 제외
 
 **위치**: `src/core/checker/codeChecker.js:276-280`
@@ -108,7 +100,6 @@ LLM 응답 description에 줄바꿈이 있으면 GitHub Actions가 깨짐. `%0A`
 | C1 | 파일 검사 정확도 ↑↑↑ | 중 |
 | C2 | 선택 검사 6000줄 라인 정확도 | 중~상 |
 | C3 | 동시 요청 안정성 | 하 |
-| H1 | 선택 검사 작동 | 하 |
 | H2 | import 규칙 작동 | 하 |
 | H3 | 청킹 검사 속도 | 중 |
 | H4 | 검사 속도 | 하 |
