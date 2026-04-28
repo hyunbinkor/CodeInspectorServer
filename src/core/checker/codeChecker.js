@@ -36,7 +36,6 @@ import { MethodChunker }    from '../chunker/methodChunker.js';
 import { ChunkResultMerger } from '../chunker/chunkResultMerger.js';
 import { getQdrantRuleRepository } from '../../repositories/impl/QdrantRuleRepository.js';  // [Fix #1] Repository 추가
 import { listFiles, readTextFile, writeJsonFile } from '../../utils/fileUtils.js';
-import { addLineNumbers }   from '../../utils/codeUtils.js';
 import { createRegexSafe }  from '../../utils/regexUtils.js';
 import { config }           from '../../config/index.js';
 import logger               from '../../utils/loggerUtils.js';
@@ -799,10 +798,16 @@ export class CodeChecker {
       .filter(Boolean);
 
     const isChunked = !!options.chunkContext;
-    const truncatedCode = this.truncateCode(sourceCode, 80000, preserveLines, { chunked: isChunked });
 
-    // ✅ [Fix] LLM에게 라인 번호가 붙은 코드를 전달
-    const numberedCode = addLineNumbers(truncatedCode, 1);
+    // [Fix C2] truncateCode 자체가 결과에 원본 라인 번호 prefix를 부여하도록 함.
+    //   기존: truncate → addLineNumbers(_, 1) 순서 → "// ... (N줄 생략) ..." 삽입 후
+    //         1부터 새로 번호가 매겨져 LLM 라인 보고와 원본 파일 라인이 어긋남.
+    //   수정: truncateCode가 라인 단위로 보존된 줄에 원본 1-based 번호를 prefix로 붙임.
+    //         생략 주석 자리는 prefix 없이 LLM이 무시하도록 둠.
+    const numberedCode = this.truncateCode(sourceCode, 80000, preserveLines, {
+      chunked: isChunked,
+      preserveOriginalLineNumbers: true
+    });
 
     // ✅ [Fix] 청킹 시 클래스명 컨텍스트
     const chunkContext = options.chunkContext || null;
@@ -886,7 +891,8 @@ export class CodeChecker {
   /**
    * 단일 규칙 검증 프롬프트
    *
-   * sourceCode 는 addLineNumbers() 로 이미 번호가 붙어 있음.
+   * sourceCode 는 truncateCode(...preserveOriginalLineNumbers:true) 결과로
+   * 원본 1-based 라인 번호 prefix가 이미 붙어 있다.
    *
    * @param {string}      sourceCode   - 라인 번호가 붙은 코드
    * @param {Object}      item         - 검증 대상 (rule + candidates 등)
@@ -1154,21 +1160,37 @@ ${rulesDescription}
   /**
    * 코드 truncation (3단계)
    *
-   * Step 1: 100000자 이하면 전체 투입
+   * Step 1: maxLength 이하면 전체 투입
    * Step 2: 주석 처리된 코드 제거 (이중주석, 주석코드 등)
    * Step 3: 후보 라인에서 먼 줄부터 제거
    *         - chunked=true  (파일 검사): 메서드 시그니처 보존 + 후보 가까운 줄 보존
    *         - chunked=false (선택 검사): 후보 가까운 줄만 보존
    *
+   * [Fix C2] options.preserveOriginalLineNumbers=true 시
+   *   결과의 각 줄 앞에 원본 1-based 라인 번호를 prefix로 부여한다
+   *   ("  42: code"). addLineNumbers를 별도 호출하면 truncated 후
+   *   1부터 새로 매겨져 LLM 라인 보고가 원본과 어긋나기 때문.
+   *   "// ... (N줄 생략) ..." 자리는 prefix 없이 그대로 둔다 (LLM이 무시).
+   *
    * @param {string}   code          - 소스 코드
    * @param {number}   maxLength     - 최대 글자 수
    * @param {number[]} preserveLines - 반드시 보존할 라인 번호 (1-based)
-   * @param {Object}   options       - { chunked: boolean }
-   * @returns {string} 잘린 코드
+   * @param {Object}   options       - { chunked, preserveOriginalLineNumbers }
+   * @returns {string} 잘린 코드 (옵션 사용 시 라인 번호 prefix 포함)
    */
   truncateCode(code, maxLength, preserveLines = [], options = {}) {
+    const withLineNum = options.preserveOriginalLineNumbers || false;
+    const prefix = (originalLineNum) =>
+      withLineNum ? `${String(originalLineNum).padStart(4, ' ')}: ` : '';
+
     // ─── Step 1: 전체 코드 투입 시도 ─────────────────────────────────
-    if (!code || code.length <= maxLength) return code;
+    if (!code) return code;
+    if (code.length <= maxLength) {
+      if (!withLineNum) return code;
+      return code.split('\n')
+        .map((line, i) => `${prefix(i + 1)}${line}`)
+        .join('\n');
+    }
 
     const lines = code.split('\n');
 
@@ -1220,11 +1242,31 @@ ${rulesDescription}
     }
 
     const cleanedCode = afterCommentClean.join('\n');
-    if (cleanedCode.length <= maxLength) return cleanedCode;
+    if (cleanedCode.length <= maxLength) {
+      if (!withLineNum) return cleanedCode;
+      return afterCommentClean
+        .map((line, i) => `${prefix(lineMapping[i] + 1)}${line}`)
+        .join('\n');
+    }
 
     // ─── Step 3: 후보 라인에서 먼 줄부터 제거 ────────────────────────
     if (preserveLines.length === 0) {
       // 보존 라인 없으면 앞뒤 폴백
+      // 라인 번호 prefix가 켜진 상태에서는 "앞뒤 byte 절반 자르기"가 라인 prefix를
+      // 깨뜨리므로 라인 단위 폴백으로 변경한다.
+      if (withLineNum) {
+        const lineCount = afterCommentClean.length;
+        const headLines = Math.floor(lineCount / 2);
+        const tailLines = lineCount - headLines;
+        const head = afterCommentClean.slice(0, headLines)
+          .map((line, i) => `${prefix(lineMapping[i] + 1)}${line}`).join('\n');
+        const tail = afterCommentClean.slice(-tailLines)
+          .map((line, idx) => {
+            const i = lineCount - tailLines + idx;
+            return `${prefix(lineMapping[i] + 1)}${line}`;
+          }).join('\n');
+        return `${head}\n\n// ... (truncated) ...\n\n${tail}`;
+      }
       const half  = Math.floor(maxLength / 2);
       const start = cleanedCode.substring(0, half);
       const end   = cleanedCode.substring(cleanedCode.length - half);
@@ -1280,7 +1322,7 @@ ${rulesDescription}
       currentLength -= (afterCommentClean[idx].length + 1);  // +1 for \n
     }
 
-    // 결과 조합
+    // 결과 조합 — 보존된 줄에 원본 라인 번호 prefix 부여
     const resultParts = [];
     let lastKeptIdx = -1;
 
@@ -1291,7 +1333,8 @@ ${rulesDescription}
         const skipped = i - lastKeptIdx - 1;
         resultParts.push(`// ... (${skipped}줄 생략) ...`);
       }
-      resultParts.push(afterCommentClean[i]);
+      const originalLineNum = lineMapping[i] + 1;
+      resultParts.push(`${prefix(originalLineNum)}${afterCommentClean[i]}`);
       lastKeptIdx = i;
     }
 
