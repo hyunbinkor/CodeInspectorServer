@@ -249,12 +249,72 @@ app.use(requestLogger);
 // API 라우트
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ─────────────────────────────────────────────────────────────────────────
 // 헬스 체크
+//
+// /health  : 하위 호환용 alias → /livez와 동일 응답
+// /livez   : Liveness — 프로세스가 살아있는지만 확인. 의존성 미점검.
+//            Kubernetes liveness probe가 이 경로를 폴링하면 됨.
+// /readyz  : Readiness — 외부 의존성(vLLM, Qdrant) 연결 상태 점검.
+//            모든 의존성이 healthy일 때 200, 하나라도 실패면 503.
+//            로드밸런서가 이 경로로 라우팅 결정.
+// ─────────────────────────────────────────────────────────────────────────
+
+const livenessPayload = () => ({
+  status: 'ok',
+  timestamp: new Date().toISOString(),
+  version: '1.0.0',
+  uptimeSec: Math.floor(process.uptime())
+});
+
+app.get('/livez', (req, res) => {
+  res.json(livenessPayload());
+});
+
+// 하위 호환: 기존 /health는 /livez로 동작
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
+  res.json(livenessPayload());
+});
+
+app.get('/readyz', async (req, res) => {
+  const checks = { vllm: 'unknown', qdrant: 'unknown' };
+  let allOk = true;
+
+  // vLLM 점검 — /v1/models GET (5초 타임아웃)
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 5000);
+    const r = await fetch(`${config.llm.baseUrl}/v1/models`, {
+      method: 'GET',
+      signal: controller.signal
+    });
+    clearTimeout(t);
+    checks.vllm = r.ok ? 'ok' : `http_${r.status}`;
+    if (!r.ok) allOk = false;
+  } catch (error) {
+    checks.vllm = `error: ${error.name === 'AbortError' ? 'timeout' : error.message}`;
+    allOk = false;
+  }
+
+  // Qdrant 점검 — / (root) GET (5초 타임아웃)
+  try {
+    const proto = config.qdrant.https ? 'https' : 'http';
+    const url = `${proto}://${config.qdrant.host}:${config.qdrant.port}/`;
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 5000);
+    const r = await fetch(url, { method: 'GET', signal: controller.signal });
+    clearTimeout(t);
+    checks.qdrant = r.ok ? 'ok' : `http_${r.status}`;
+    if (!r.ok) allOk = false;
+  } catch (error) {
+    checks.qdrant = `error: ${error.name === 'AbortError' ? 'timeout' : error.message}`;
+    allOk = false;
+  }
+
+  res.status(allOk ? 200 : 503).json({
+    status: allOk ? 'ready' : 'not_ready',
     timestamp: new Date().toISOString(),
-    version: '1.0.0'
+    checks
   });
 });
 
@@ -315,8 +375,10 @@ app.listen(PORT, HOST, () => {
     POST /api/data/push      데이터 업로드
   
   헬스 체크:
-    GET  /health
-  
+    GET  /livez              Liveness (프로세스 생존)
+    GET  /readyz             Readiness (vLLM/Qdrant 의존성 점검)
+    GET  /health             /livez alias (하위 호환)
+
   API 문서:
     GET  /api
   `);

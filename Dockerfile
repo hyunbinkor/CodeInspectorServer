@@ -94,8 +94,10 @@ ENV LOG_LEVEL=info
 # ───────────────────────────────────────────────────────────────────────────
 
 # 헬스체크 설정 (컨테이너 상태 모니터링)
+# Liveness probe — 프로세스 생존만 확인 (의존성 다운 시 재시작 방지)
+# Readiness 점검은 오케스트레이터(K8s 등)에서 /readyz로 별도 폴링 권장
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:3000/livez || exit 1
 
 # 포트 노출
 EXPOSE 3000

@@ -20,7 +20,9 @@ Docker 빌드/배포는 [`DEPLOYMENT.md`](./DEPLOYMENT.md) 참조.
 
 | Method | Path | 용도 |
 |---|---|---|
-| GET  | `/health` | 헬스체크 |
+| GET  | `/livez` | Liveness (프로세스 생존, 의존성 미점검) |
+| GET  | `/readyz` | Readiness (vLLM/Qdrant 연결 점검, 503 가능) |
+| GET  | `/health` | `/livez` alias (하위 호환) |
 | GET  | `/api` | 사용 가능한 엔드포인트 목록 |
 | POST | `/api/check` | 코드 검사 (heartbeat 응답) |
 | GET  | `/api/check/stats` | 필터링 통계 |
