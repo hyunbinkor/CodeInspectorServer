@@ -255,6 +255,15 @@ export class CodeChecker {
 
     logger.info(`[${fileName}] 🔪 청킹 시작...`);
 
+    // [Fix C1] 원본 코드 전체로 1회 태깅 → globalTags 추출.
+    //   청킹 진입 시 각 청크는 메서드 본문만 받으므로 클래스 레벨 정보
+    //   (@Service, class XXX extends BaseDAO 등)가 떨어져 나가
+    //   IS_DAO/IS_SERVICE 등의 태그가 안 붙는 문제가 있었다.
+    //   각 청크 검사 시 globalTags ∪ localTags로 규칙을 조회하도록 한다.
+    const globalTaggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
+    const globalTags = globalTaggingResult.tags;
+    logger.info(`[${fileName}] global 태그 ${globalTags.length}개 추출: ${globalTags.slice(0, 8).join(', ')}${globalTags.length > 8 ? ', ...' : ''}`);
+
     const chunkingResult = this.methodChunker.chunk(code, { fileName });
     const { chunks, metadata: chunkMeta } = chunkingResult;
 
@@ -265,6 +274,7 @@ export class CodeChecker {
       status:       'done',
       totalChunks:  chunkMeta.totalChunks,
       totalMethods: chunkMeta.totalMethods,
+      globalTagCount: globalTags.length,
       elapsed:      Date.now() - startTime
     });
 
@@ -299,7 +309,9 @@ export class CodeChecker {
           onProgress: (event) => onProgress({ ...event, stage: 'chunk_llm' }),
           chunkContext: {
             className: chunk.className
-          }
+          },
+          // [Fix C1] global 태그를 청크 검사에 전달하여 클래스 레벨 규칙도 매칭되게 함
+          globalTags
         });
 
         chunkResults.push({
@@ -370,9 +382,16 @@ export class CodeChecker {
     const onProgress = options.onProgress || (() => {});
     this.filteringStats.totalChecks++;
 
-    // Step 1: 코드 태깅
+    // Step 1: 코드 태깅 (local — 청크 코드 자체에서 추출)
     const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
-    const tags          = taggingResult.tags;
+    const localTags     = taggingResult.tags;
+
+    // [Fix C1] global 태그(파일 전체 기준)와 병합.
+    //   청킹 모드에서만 options.globalTags가 전달됨. 일반 호출 시 빈 배열.
+    //   클래스 레벨 태그(IS_DAO, IS_SERVICE, EXTENDS_BASE_*)는 메서드 본문만으로
+    //   추출 불가하므로 global에서 보충. 중복은 Set으로 자연 제거.
+    const globalTags = options.globalTags || [];
+    const tags = [...new Set([...globalTags, ...localTags])];
 
     // Step 2: AST 분석
     const astResult   = this.astParser.parseJavaCode(code);
