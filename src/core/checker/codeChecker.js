@@ -27,6 +27,7 @@
  */
 
 import path from 'path';
+import { AsyncLocalStorage } from 'async_hooks';
 import { getCodeTagger }    from '../tagger/codeTagger.js';
 import { getQdrantClient }  from '../clients/qdrantClient.js';
 import { getLLMClient }     from '../clients/llmClient.js';
@@ -46,6 +47,13 @@ const CHECK_TYPES = {
   LLM_CONTEXTUAL: 'llm_contextual',
   LLM_WITH_AST:   'llm_with_ast'
 };
+
+// [Fix C3] 요청별 stats 격리용 비동기 컨텍스트.
+//   동시 검사 요청이 싱글톤 CodeChecker.filteringStats를 서로 덮어써
+//   응답의 stats.llmCalls가 다른 요청 값으로 보고되던 문제를 해결.
+//   각 checkCode 진입 시 store에 빈 stats를 push, 모든 increment는
+//   _getStats()를 거쳐 store의 stats를 변경.
+const requestStorage = new AsyncLocalStorage();
 
 export class CodeChecker {
   constructor() {
@@ -67,13 +75,43 @@ export class CodeChecker {
 
     this.validCheckTypes = ['pure_regex', 'llm_with_regex', 'llm_contextual', 'llm_with_ast'];
 
-    this.filteringStats = {
-      totalChecks:          0,
-      pureRegexViolations:  0,
-      llmCandidates:        0,
-      llmCalls:             0,
+    // 누적 stats — /api/check/stats 엔드포인트 호환용. 직접 변경하지 않고
+    // 매 요청 종료 시 _mergeStatsToGlobal()로 합산만 한다.
+    this.filteringStats = this._createEmptyStats();
+  }
+
+  /**
+   * 빈 stats 객체 생성
+   * @private
+   */
+  _createEmptyStats() {
+    return {
+      totalChecks:            0,
+      pureRegexViolations:    0,
+      llmCandidates:          0,
+      llmCalls:               0,
       falsePositivesFiltered: 0
     };
+  }
+
+  /**
+   * 현재 요청 컨텍스트의 stats를 반환. 컨텍스트 밖에서 호출 시
+   * 전역 stats로 폴백 (legacy code path 호환).
+   * @private
+   */
+  _getStats() {
+    const store = requestStorage.getStore();
+    return store?.stats || this.filteringStats;
+  }
+
+  /**
+   * 요청별 stats를 전역 누적치에 합산
+   * @private
+   */
+  _mergeStatsToGlobal(stats) {
+    for (const [key, value] of Object.entries(stats)) {
+      this.filteringStats[key] = (this.filteringStats[key] || 0) + value;
+    }
   }
 
   async initialize() {
@@ -160,12 +198,23 @@ export class CodeChecker {
    * 코드 점검 메인 (일반 모드 / 청킹 모드 자동 분기)
    */
   async checkCode(code, fileName = 'unknown', options = {}) {
+    // [Fix C3] 요청별 stats를 AsyncLocalStorage로 격리.
+    //   기존 [Fix #10]은 진입 시 전역 reset → 동시 요청 간 race 발생.
+    //   이제 각 요청은 자체 stats를 들고 다니고, 마무리 시 전역에 합산만 한다.
+    const stats = this._createEmptyStats();
+    return await requestStorage.run({ stats }, async () => {
+      try {
+        return await this._checkCodeInner(code, fileName, options);
+      } finally {
+        this._mergeStatsToGlobal(stats);
+      }
+    });
+  }
+
+  async _checkCodeInner(code, fileName, options) {
     const startTime  = Date.now();
     const onProgress = options.onProgress || (() => {});
     const lineCount  = code.split('\n').length;
-
-    // [Fix #10] 검사 요청별 통계 리셋 — 이전 검사의 누적값이 남지 않도록
-    this.resetFilteringStats();
 
     // ✅ [Fix] checkMode 기반 청킹 결정
     // file      = 무조건 청킹 (파일 전체 검사)
@@ -184,7 +233,7 @@ export class CodeChecker {
     }
 
     // ─── 일반 모드 ────────────────────────────────────────────────────────
-    this.filteringStats.totalChecks++;
+    this._getStats().totalChecks++;
 
     logger.debug(`[${fileName}] 태깅 시작...`);
     const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
@@ -348,7 +397,7 @@ export class CodeChecker {
         issues:  mergedResult.issues,
         summary: mergedResult.summary,
         stats: {
-          ...this.filteringStats,
+          ...this._getStats(),
           processingTime:  totalElapsed,
           chunksProcessed: mergedResult.processing.processedChunks,
           totalChunks:     mergedResult.processing.totalChunks
@@ -361,14 +410,14 @@ export class CodeChecker {
         annotations,
         issues:  mergedResult.issues,
         summary: mergedResult.summary,
-        stats:   { ...this.filteringStats, processingTime: totalElapsed }
+        stats:   { ...this._getStats(), processingTime: totalElapsed }
       };
     } else {
       const simple = this.chunkResultMerger.toSimpleJSON(mergedResult);
       return {
         success: true, chunked: true, format: 'json',
         ...simple,
-        stats: { ...this.filteringStats, processingTime: totalElapsed }
+        stats: { ...this._getStats(), processingTime: totalElapsed }
       };
     }
   }
@@ -379,7 +428,7 @@ export class CodeChecker {
   async checkCodeDirect(code, fileName, options = {}) {
     const startTime  = Date.now();
     const onProgress = options.onProgress || (() => {});
-    this.filteringStats.totalChecks++;
+    this._getStats().totalChecks++;
 
     // Step 1: 코드 태깅 (local — 청크 코드 자체에서 추출)
     const taggingResult = await this.codeTagger.extractTags(code, { useLLM: false });
@@ -429,7 +478,7 @@ export class CodeChecker {
     return {
       success: true,
       issues:  uniqueIssues,
-      stats:   { llmCalls: this.filteringStats.llmCalls, llmCandidates: filterResult.llmCandidates.total }
+      stats:   { llmCalls: this._getStats().llmCalls, llmCandidates: filterResult.llmCandidates.total }
     };
   }
 
@@ -828,7 +877,7 @@ export class CodeChecker {
         });
         const elapsed = Date.now() - startTime;
 
-        this.filteringStats.llmCalls++;
+        this._getStats().llmCalls++;
         logger.debug(`[${fileName}] 규칙 ${ruleNum}/${allItems.length} [${rule.ruleId}]: ${elapsed}ms`);
 
         const parsed = this.llmClient.cleanAndExtractJSON(response);
@@ -868,7 +917,7 @@ export class CodeChecker {
 
       } catch (error) {
         logger.warn(`[${fileName}] 규칙 ${ruleNum} [${rule.ruleId}] LLM 실패: ${error.message}`);
-        this.filteringStats.llmCalls++;
+        this._getStats().llmCalls++;
 
         onProgress({
           stage:    'llm',
@@ -882,7 +931,7 @@ export class CodeChecker {
       }
     }
 
-    logger.info(`[${fileName}] LLM 검증 완료: ${violations.length}개 위반 발견 (${this.filteringStats.llmCalls}회 호출)`);
+    logger.info(`[${fileName}] LLM 검증 완료: ${violations.length}개 위반 발견 (${this._getStats().llmCalls}회 호출)`);
     return violations;
   }
 
