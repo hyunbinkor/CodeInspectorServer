@@ -29,6 +29,12 @@ export const config = {
     model: process.env.VLLM_MODEL || 'Qwen/Qwen2.5-Coder-32B-Instruct',
     timeout: parseInt(process.env.VLLM_TIMEOUT) || 180000,
     maxRetries: parseInt(process.env.VLLM_MAX_RETRIES) || 3,
+    // [Fix H4] LLM 호출 사이 지연 (ms). 0이면 지연 없음.
+    //   기존엔 verifyWithLLM 루프에 100ms 하드코딩되어 50개 규칙 시 5초 추가 지연.
+    //   vLLM은 자체 큐로 동시성 처리하므로 기본 0으로 두고, rate limit 환경에서만 설정.
+    requestDelayMs: parseInt(process.env.VLLM_REQUEST_DELAY_MS) || 0,
+    // [Fix H3] 청크 병렬 처리 동시성. 기본 3. vLLM 용량에 맞춰 조정.
+    chunkConcurrency: parseInt(process.env.CHUNK_CONCURRENCY) || 3,
     defaultSystemPrompt: 'You are an expert software developer specializing in Java code analysis.'
   },
 
