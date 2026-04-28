@@ -107,6 +107,13 @@ docker run -d \
 | `VLLM_MODEL` | Qwen/Qwen2.5-Coder-32B-Instruct | 모델명 | 유지 |
 | `VLLM_TIMEOUT` | 180000 | 타임아웃(ms) | 선택 |
 | `LOG_LEVEL` | info | 로그 레벨 (error/warn/info/debug) | 선택 |
+| `NODE_TLS_REJECT_UNAUTHORIZED` | (unset) | TLS 인증서 검증. 자체 서명 인증서 사용 시 0 | 환경따라 |
+
+> **TLS 검증 안내**
+> 내부망 Qdrant/vLLM이 자체 서명 인증서를 사용하면 컨테이너 시작 시 TLS 핸드셰이크가 실패할 수 있습니다.
+> - **권장**: 사내 CA 인증서를 컨테이너에 마운트 (`-v /path/to/ca.crt:/etc/ssl/certs/internal-ca.crt`).
+> - **임시 우회**: `-e NODE_TLS_REJECT_UNAUTHORIZED=0` — MITM에 취약하므로 격리된 내부망에서만 사용.
+> 이전 이미지(<=1.0.0)는 기본값으로 `0`을 설정했으나, 보안 영향이 커 1.0.x 이후 제거되었습니다.
 
 ---
 
