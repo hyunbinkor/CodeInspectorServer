@@ -4,7 +4,7 @@
  *
  * Usage:
  *   node test-api.js [server-url]
- *   node test-api.js http://192.168.100.50:3000
+ *   node test-api.js http://localhost:3000
  *
  * 파일 구조:
  *   data/
