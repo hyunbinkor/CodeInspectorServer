@@ -137,14 +137,16 @@ export class ChunkResultMerger {
   }
 
   /**
-   * 중복 이슈 제거
+   * 중복 이슈 제거.
+   * [Fix H5] codeChecker.deduplicateViolations와 키 형식 통일.
+   *   description은 LLM이 매번 다르게 생성하므로 키에서 제외.
    */
   deduplicateIssues(issues) {
-    const seen = new Map();
+    const seen = new Set();
     return issues.filter(issue => {
-      const key = `${issue.ruleId}-${issue.line}-${issue.description?.substring(0, 50) || ''}`;
+      const key = `${issue.ruleId}@${issue.line}:${issue.column || 0}`;
       if (seen.has(key)) return false;
-      seen.set(key, true);
+      seen.add(key);
       return true;
     });
   }

@@ -184,11 +184,36 @@ export class CheckService {
       const level = this.severityToGitHubLevel(issue.severity);
       const line = issue.line || 1;
       const col = issue.column || 1;
-      const title = `${issue.title || issue.ruleId} (${issue.ruleId})`;
-      const message = issue.description || issue.message || issue.title;
+      const title = this._escapeGitHubProperty(`${issue.title || issue.ruleId} (${issue.ruleId})`);
+      const message = this._escapeGitHubMessage(issue.description || issue.message || issue.title || '');
 
       return `::${level} file=${fileName},line=${line},col=${col},title=${title}::${message}`;
     }).join('\n');
+  }
+
+  /**
+   * [Fix M3] GitHub Actions workflow command 메시지 이스케이프.
+   *   message 본문은 한 줄로 합쳐져야 하므로 줄바꿈은 %0A,
+   *   캐리지리턴은 %0D로 인코딩한다.
+   *   https://docs.github.com/en/actions/using-workflows/workflow-commands
+   * @private
+   */
+  _escapeGitHubMessage(text) {
+    return String(text).replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+  }
+
+  /**
+   * GitHub workflow command property 이스케이프 (title 등).
+   *   ::set-output name=foo::bar 같은 구분자 깨짐 방지를 위해
+   *   `,`, `:`도 이스케이프한다.
+   * @private
+   */
+  _escapeGitHubProperty(text) {
+    return String(text)
+      .replace(/\r/g, '%0D')
+      .replace(/\n/g, '%0A')
+      .replace(/,/g, '%2C')
+      .replace(/:/g, '%3A');
   }
 
   /**
