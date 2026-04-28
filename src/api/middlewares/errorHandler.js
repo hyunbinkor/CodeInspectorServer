@@ -9,7 +9,7 @@ import logger from '../../utils/loggerUtils.js';
 /**
  * 404 Not Found 핸들러
  */
-export function notFoundHandler(req, res, next) {
+export function notFoundHandler(req, res, _next) {
   res.status(404).json({
     success: false,
     error: 'NOT_FOUND',
@@ -20,7 +20,9 @@ export function notFoundHandler(req, res, next) {
 /**
  * 글로벌 에러 핸들러
  */
-export function errorHandler(err, req, res, next) {
+// Express는 4-arg 시그니처로 에러 핸들러를 인식하므로 _next는 시그니처상 필수
+// (실제 호출은 안 하지만 인자 위치를 비울 수 없음)
+export function errorHandler(err, req, res, _next) {
   // 에러 로깅
   logger.error('에러 발생:', {
     message: err.message,

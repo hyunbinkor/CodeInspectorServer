@@ -147,7 +147,7 @@ export class LLMClient {
           logger.info(`⏳ ${delay / 1000}초 후 재시도...`);
           await this._sleep(delay);
         } else {
-          throw new Error(`vLLM 생성 실패 (${maxRetries}번 시도): ${error.message}`);
+          throw new Error(`vLLM 생성 실패 (${maxRetries}번 시도): ${error.message}`, { cause: error });
         }
       }
     }
@@ -222,7 +222,7 @@ export class LLMClient {
       clearTimeout(timeoutId);
       
       if (error.name === 'AbortError') {
-        throw new Error(`요청 타임아웃 (${timeoutMs}ms)`);
+        throw new Error(`요청 타임아웃 (${timeoutMs}ms)`, { cause: error });
       }
       throw error;
     }
@@ -240,7 +240,7 @@ export class LLMClient {
     logger.debug('🔍 JSON 추출 시작...');
     
     // 1. 응답 정제 (기존 cleanCommonResponse 로직)
-    let cleaned = this._cleanResponse(response);
+    const cleaned = this._cleanResponse(response);
     
     // 2. JSON 추출 (기존 extractJSONFromText 로직)
     return this._extractJSONFromText(cleaned);

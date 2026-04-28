@@ -78,7 +78,7 @@ export class RuleTagger {
 
       // checkType 검증 및 조정 (금융권 원칙)
       let checkType = tagResult.checkType || 'llm_contextual';
-      let checkTypeReason = tagResult.reasoning || '';
+      const checkTypeReason = tagResult.reasoning || '';
       
       checkType = this.validateAndAdjustCheckType(checkType, rule, tagResult);
 

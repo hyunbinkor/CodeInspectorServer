@@ -39,7 +39,10 @@ export default [
       'eqeqeq': ['error', 'smart'],
       'no-unused-vars': ['warn', {
         argsIgnorePattern: '^_',
-        varsIgnorePattern: '^_'
+        varsIgnorePattern: '^_',
+        // catch (error)/(e)/(error2) 패턴은 의도적으로 무시한 것이라 경고 안 냄.
+        // _ 접두사를 강제하면 기존 코드 광범위 수정 필요해 실용적으로 패턴 허용.
+        caughtErrorsIgnorePattern: '^(_|e|err|error|error\\d*)$'
       }],
 
       // 노이즈 줄이기
@@ -52,6 +55,14 @@ export default [
       // ESLint v10 신규 strict 룰 — 점진적으로 적용 예정이므로 일단 warn
       'preserve-caught-error': 'warn',      // catch에서 cause 첨부 권고
       'no-useless-assignment': 'warn'
+    }
+  },
+  {
+    // 인터페이스 파일은 시그니처 유지를 위해 unused 인자 허용
+    // (flat config는 나중 항목이 우선이므로 메인 룰 뒤에 와야 효과 발휘)
+    files: ['src/repositories/I*Repository.js'],
+    rules: {
+      'no-unused-vars': 'off'
     }
   }
 ];

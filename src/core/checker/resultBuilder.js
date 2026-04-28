@@ -6,8 +6,6 @@
  * @module checker/resultBuilder
  */
 
-import logger from '../../utils/loggerUtils.js';
-
 export class ResultBuilder {
   constructor() {
     // 심각도 우선순위

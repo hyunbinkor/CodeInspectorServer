@@ -111,7 +111,7 @@ export class QdrantClient {
       return true;
     } catch (error) {
       logger.error('Qdrant 연결 실패:', error.message);
-      throw new Error(`Qdrant 연결 실패: ${error.message}`);
+      throw new Error(`Qdrant 연결 실패: ${error.message}`, { cause: error });
     }
   }
 
