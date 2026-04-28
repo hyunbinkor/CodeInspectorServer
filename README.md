@@ -6,7 +6,7 @@ Java 코드 품질 검사 시스템의 REST API 서버입니다.
 
 ### 사전 요구사항
 
-- Node.js 18.0.0+
+- Node.js 22.0.0+ (Dockerfile은 `node:22-alpine` 기반)
 - Qdrant 벡터 데이터베이스
 - vLLM 서버 (선택)
 
