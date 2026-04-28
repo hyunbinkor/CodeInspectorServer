@@ -1,5 +1,28 @@
-node_modules
+# 의존성
+node_modules/
+
+# 환경 변수 (.env.example만 커밋)
 .env
-asssets
+.env.local
+.env.*.local
+
+# 빌드 산출물
+code-quality-server-*.tar
+code-quality-server-*.tar.gz
+
+# 런타임 백업/임시 (서버가 자동 생성)
+backup/
+*.log
+
+# 로컬 테스트 스크립트
 test-api.sh
-code-quality-server-1.0.0.tar
+
+# IDE / 도구
+.claude/
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
