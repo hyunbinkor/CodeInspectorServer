@@ -40,9 +40,9 @@ services:
     ports:
       - "3000:3000"
     
-    # 헬스체크
+    # 헬스체크 — /livez (의존성 미점검). /readyz는 오케스트레이터에서 별도 폴링.
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/livez"]
       interval: 30s
       timeout: 10s
       retries: 3
