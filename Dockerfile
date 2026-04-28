@@ -61,9 +61,13 @@ ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
 
-# CORS 설정
+# CORS 설정 (운영에서는 화이트리스트 권장)
 ENV CORS_ORIGIN=*
-ENV NODE_TLS_REJECT_UNAUTHORIZED=0
+
+# TLS 검증
+# 내부망에서 자체 서명 인증서를 사용하는 경우 docker run -e NODE_TLS_REJECT_UNAUTHORIZED=0
+# 으로 주입할 수 있으나, 가능하면 CA 체인을 컨테이너에 마운트하여 검증을 유지할 것.
+# 보안 영향이 크므로 이미지 기본값으로는 설정하지 않는다.
 
 # ─── 쓰기 경로 설정 (/tmp 사용 - 권한 문제 우회) ───
 ENV BACKUP_PATH=/tmp/backup
