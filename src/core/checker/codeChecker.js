@@ -326,48 +326,52 @@ export class CodeChecker {
       elapsed:      Date.now() - startTime
     });
 
-    const chunkResults = [];
+    // [Fix H2] header/footer 청크도 pure_regex 규칙은 검사한다.
+    //   이전엔 무조건 continue로 스킵하여 import 관련 규칙
+    //   (deprecated API import, wildcard import 금지 등)이 영구 미탐지 상태였음.
+    //   options.skipLLM=true로 호출하여 LLM 비용은 들이지 않고 정규식 규칙만 적용.
+    //
+    // [Fix H3] for 루프 → Promise 풀로 변환하여 청크를 동시 처리.
+    //   동시성은 config.llm.chunkConcurrency (기본 3, env로 조정).
+    const concurrency = Math.max(1, config.llm.chunkConcurrency || 3);
+    logger.info(`[${fileName}] 청크 병렬 처리: 동시성 ${concurrency}`);
 
-    for (let i = 0; i < chunks.length; i++) {
+    const chunkResults = new Array(chunks.length);
+    let nextChunkIdx = 0;
+
+    const processOneChunk = async (i) => {
       const chunk = chunks[i];
-
-      if (chunk.type === 'header' || chunk.type === 'footer') {
-        logger.debug(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.type}] 스킵`);
-        chunkResults.push({ chunkIndex: chunk.index, issues: [], processingTime: 0, llmCalls: 0 });
-        continue;
-      }
-
       const chunkStartTime = Date.now();
+      const isHeaderOrFooter = chunk.type === 'header' || chunk.type === 'footer';
 
       onProgress({
         stage:       'chunk_start',
         chunkIndex:  i + 1,
         chunkTotal:  chunks.length,
         methodName:  chunk.methodName || `chunk_${i + 1}`,
-        lineRange:   chunk.lineRange  || null
+        lineRange:   chunk.lineRange  || null,
+        chunkType:   chunk.type
       });
 
-      logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName}] 검사 중...`);
+      logger.info(`[${fileName}] 청크 ${i + 1}/${chunks.length} [${chunk.methodName || chunk.type}] 검사 중${isHeaderOrFooter ? ' (regex only)' : ''}...`);
 
       try {
-        // ✅ [Fix] 메서드 코드만 전송, 클래스명만 chunkContext로 별도 전달 (import 제외)
-        const chunkCode = chunk.code;
-
-        const result = await this.checkCodeDirect(chunkCode, fileName, {
+        const result = await this.checkCodeDirect(chunk.code, fileName, {
           onProgress: (event) => onProgress({ ...event, stage: 'chunk_llm' }),
           chunkContext: {
             className: chunk.className
           },
-          // [Fix C1] global 태그를 청크 검사에 전달하여 클래스 레벨 규칙도 매칭되게 함
-          globalTags
+          globalTags,
+          // header/footer는 LLM 비용 없이 pure_regex만 적용
+          skipLLM: isHeaderOrFooter
         });
 
-        chunkResults.push({
+        chunkResults[i] = {
           chunkIndex:     chunk.index,
           issues:         result.issues || [],
           processingTime: Date.now() - chunkStartTime,
           llmCalls:       result.stats?.llmCalls || 0
-        });
+        };
 
         onProgress({
           stage:       'chunk_done',
@@ -377,12 +381,23 @@ export class CodeChecker {
           issuesFound: result.issues?.length || 0,
           elapsed:     Date.now() - chunkStartTime
         });
-
       } catch (error) {
         logger.error(`[${fileName}] 청크 ${i + 1} 검사 실패: ${error.message}`);
-        chunkResults.push({ chunkIndex: chunk.index, issues: [], processingTime: 0, llmCalls: 0 });
+        chunkResults[i] = { chunkIndex: chunk.index, issues: [], processingTime: 0, llmCalls: 0 };
       }
-    }
+    };
+
+    const runWorker = async () => {
+      while (true) {
+        const idx = nextChunkIdx++;
+        if (idx >= chunks.length) return;
+        await processOneChunk(idx);
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, chunks.length) }, runWorker)
+    );
 
     const totalElapsed = Date.now() - startTime;
     logger.info(`[${fileName}] 청킹 검사 완료 (${totalElapsed}ms)`);
@@ -465,7 +480,9 @@ export class CodeChecker {
 
     // Step 6: LLM 검증
     // ✅ [Fix] options를 verifyWithLLM에 전달하여 chunkContext가 프롬프트까지 도달
-    if (filterResult.llmCandidates.total > 0) {
+    // [Fix H2] options.skipLLM=true(헤더/푸터 청크)면 LLM 검증을 건너뛰어
+    //   pure_regex 결과만 반환한다.
+    if (!options.skipLLM && filterResult.llmCandidates.total > 0) {
       const llmViolations = await this.verifyWithLLM(
         code, astAnalysis, filterResult.llmCandidates, fileName, tags, onProgress, options
       );
@@ -913,7 +930,9 @@ export class CodeChecker {
           elapsed:  Date.now() - itemStartTime
         });
 
-        if (i < allItems.length - 1) await this._sleep(100);
+        // [Fix H4] 100ms 하드코딩 → config 기반. 기본 0 (지연 없음).
+        const delay = config.llm.requestDelayMs || 0;
+        if (delay > 0 && i < allItems.length - 1) await this._sleep(delay);
 
       } catch (error) {
         logger.warn(`[${fileName}] 규칙 ${ruleNum} [${rule.ruleId}] LLM 실패: ${error.message}`);
