@@ -1,0 +1,9 @@
+node_modules/
+backup/
+*.tar
+*.log
+coverage/
+.env.local
+.env.*.local
+dist/
+build/
