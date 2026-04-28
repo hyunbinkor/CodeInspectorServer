@@ -780,7 +780,7 @@ export class CodeChecker {
       .filter(Boolean);
 
     const isChunked = !!options.chunkContext;
-    const truncatedCode = this.truncateCode(sourceCode0000, preserveLines, { chunked: isChunked });
+    const truncatedCode = this.truncateCode(sourceCode, 80000, preserveLines, { chunked: isChunked });
 
     // ✅ [Fix] LLM에게 라인 번호가 붙은 코드를 전달
     const numberedCode = addLineNumbers(truncatedCode, 1);
